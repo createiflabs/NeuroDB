@@ -81,3 +81,16 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Sync this README onto the Docker Hub repository page (Docker Hub does not
+      # do this automatically). Best-effort: never fail the publish over it.
+      - name: Sync README to Docker Hub
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: createiflabs
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: createiflabs/neurodb
+          short-description: "Content-addressable store powered by Modern Hopfield networks."
+          readme-filepath: ./README.md

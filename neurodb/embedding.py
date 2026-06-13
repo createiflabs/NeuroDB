@@ -6,8 +6,9 @@ transformer embedding, but it requires no downloads, runs anywhere and is good
 enough to make semantic-ish search demos work out of the box.
 
 For production workloads, generate embeddings with your model of choice (OpenAI,
-Cohere, sentence-transformers, ...) and push the raw vectors to the ``/vectors``
-endpoints instead of the ``/texts`` convenience endpoints.
+Cohere, sentence-transformers, ...) and push the raw vectors to
+``POST /memories/{name}/patterns`` instead of the ``/texts`` convenience
+endpoints.
 """
 
 from __future__ import annotations

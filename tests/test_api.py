@@ -1,17 +1,3 @@
-import pytest
-from fastapi.testclient import TestClient
-
-from neurodb.config import Settings
-from neurodb.server import create_app
-
-
-@pytest.fixture()
-def client(tmp_path):
-    settings = Settings(data_file=str(tmp_path / "db.npz"), autosave_interval=0.0)
-    with TestClient(create_app(settings)) as test_client:
-        yield test_client
-
-
 def test_health_and_version(client):
     health = client.get("/health")
     assert health.status_code == 200
@@ -72,6 +58,25 @@ def test_text_endpoints_recall(client):
     assert 0.0 <= recall["top"]["weight"] <= 1.0
 
 
+def test_empty_memory_recall_returns_200(client):
+    # A fresh, empty memory must not error on recall/complete/anomaly — the
+    # dashboard's first "Recall" should show an empty result, not a 400.
+    client.post("/memories", json={"name": "m", "dimension": 3})
+    complete = client.post("/memories/m/complete", json={"query": [1, 0, 0]})
+    assert complete.status_code == 200
+    assert complete.json()["weights"] == []
+    anomaly = client.post("/memories/m/anomaly", json={"query": [1, 0, 0]})
+    assert anomaly.status_code == 200
+    assert anomaly.json()["fields"] == []
+
+
+def test_bad_filter_operator_returns_400(client):
+    client.post("/memories", json={"name": "m", "dimension": 2})
+    client.post("/memories/m/patterns", json={"items": [{"vector": [1, 0], "metadata": {"p": 1}}]})
+    resp = client.post("/memories/m/search", json={"query": [1, 0], "filter": {"p": {"$in": "x"}}})
+    assert resp.status_code == 400
+
+
 def test_missing_memory_returns_404(client):
     assert client.get("/memories/nope").status_code == 404
 
@@ -82,11 +87,9 @@ def test_dimension_mismatch_returns_400(client):
     assert response.status_code == 400
 
 
-def test_api_key_protects_data_routes(tmp_path):
-    settings = Settings(data_file=str(tmp_path / "db.npz"), autosave_interval=0.0, api_key="secret")
-    with TestClient(create_app(settings)) as client:
-        assert client.get("/health").status_code == 200
-        assert client.get("/memories").status_code == 401
-        assert client.get("/memories", headers={"X-API-Key": "secret"}).status_code == 200
-        bearer = client.get("/memories", headers={"Authorization": "Bearer secret"})
-        assert bearer.status_code == 200
+def test_api_key_protects_data_routes(auth_client):
+    assert auth_client.get("/health").status_code == 200
+    assert auth_client.get("/memories").status_code == 401
+    assert auth_client.get("/memories", headers={"X-API-Key": "secret"}).status_code == 200
+    bearer = auth_client.get("/memories", headers={"Authorization": "Bearer secret"})
+    assert bearer.status_code == 200

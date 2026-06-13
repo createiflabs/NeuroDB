@@ -6,6 +6,7 @@ Run with ``python -m neurodb`` or ``uvicorn neurodb.server:app``.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -111,7 +112,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         token = x_api_key
         if not token and authorization and authorization.lower().startswith("bearer "):
             token = authorization[7:]
-        if token != settings.api_key:
+        # Constant-time comparison to avoid leaking the key via response timing.
+        if not hmac.compare_digest(token or "", settings.api_key):
             raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
     # -- public endpoints -------------------------------------------------
@@ -148,6 +150,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @api.get("/stats", tags=["system"])
     async def stats():
         return store.stats()
+
+    @api.post("/flush", tags=["system"])
+    async def flush():
+        """Synchronously persist all dirty memories (fsync-durable) and report
+        how many were written."""
+
+        persisted = await run_in_threadpool(store.flush)
+        return {"persisted": persisted, "durable": True}
 
     @api.post("/memories", tags=["memories"], status_code=201)
     async def create_memory(body: CreateMemoryRequest):

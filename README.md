@@ -48,10 +48,6 @@ pattern (exact content-addressable memory and pattern completion); with a low
 ### 🐳 Docker
 
 ```bash
-# GitHub Container Registry (published by CI on every push to main):
-docker run -d --name neurodb -p 8000:8000 -v neurodb_data:/data ghcr.io/createiflabs/neurodb:latest
-
-# Docker Hub (published once the DOCKERHUB_TOKEN secret is configured):
 docker run -d --name neurodb -p 8000:8000 -v neurodb_data:/data createiflabs/neurodb:latest
 ```
 
@@ -239,8 +235,8 @@ python examples/quickstart.py   # end-to-end demo against a running server
 ```
 
 CI lints and tests on Python 3.10–3.12, then builds a multi-arch
-(`linux/amd64`, `linux/arm64`) image and publishes it to GHCR (always) and Docker
-Hub (when `DOCKERHUB_TOKEN` is set).
+(`linux/amd64`, `linux/arm64`) image and publishes it to Docker Hub
+(`createiflabs/neurodb`) on pushes to `main` and version tags.
 
 ---
 

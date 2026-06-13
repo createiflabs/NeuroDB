@@ -1,0 +1,11 @@
+# Normalise all text files to LF in the repository so the Docker build and
+# Linux CI never see stray CRLF line endings, regardless of contributor OS.
+* text=auto eol=lf
+
+# Binary assets must never be normalised.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.npy binary

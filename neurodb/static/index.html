@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NeuroDB — vector database</title>
+<style>
+  :root {
+    --bg: #0a0c12;
+    --panel: #12151f;
+    --panel-2: #171b28;
+    --border: #232838;
+    --text: #e7ecf5;
+    --muted: #8b93a7;
+    --accent: #7c5cff;
+    --accent-2: #19d3da;
+    --good: #2ee6a6;
+    --bad: #ff5d6c;
+    --radius: 14px;
+    font-synthesis: none;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 800px at 80% -10%, #1a1640 0%, transparent 55%),
+                radial-gradient(1000px 700px at -10% 10%, #07303a 0%, transparent 50%),
+                var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent-2); }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 40px 22px 80px; }
+  header { display: flex; align-items: center; gap: 16px; margin-bottom: 6px; }
+  .logo {
+    width: 46px; height: 46px; border-radius: 12px; flex: 0 0 auto;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: grid; place-items: center; box-shadow: 0 8px 30px rgba(124,92,255,.35);
+  }
+  .logo svg { width: 26px; height: 26px; }
+  h1 { font-size: 26px; margin: 0; letter-spacing: -.02em; }
+  h1 span { color: var(--accent-2); }
+  .tag { color: var(--muted); font-size: 14px; margin: 2px 0 0; }
+  .status {
+    margin-left: auto; text-align: right; font-size: 12px; color: var(--muted);
+    line-height: 1.5;
+  }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--bad); margin-right:6px; vertical-align: middle;}
+  .dot.ok { background: var(--good); box-shadow: 0 0 10px var(--good); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 26px; }
+  @media (max-width: 760px){ .grid{ grid-template-columns: 1fr; } }
+  .card {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; box-shadow: 0 10px 40px rgba(0,0,0,.25);
+  }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 14px; }
+  label { display:block; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
+  textarea, input[type=text], input[type=number] {
+    width: 100%; background: #0c0f18; border: 1px solid var(--border); color: var(--text);
+    border-radius: 10px; padding: 11px 12px; font-size: 14px; font-family: inherit; resize: vertical;
+  }
+  textarea:focus, input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124,92,255,.18); }
+  textarea { min-height: 120px; line-height: 1.5; }
+  button {
+    appearance: none; border: 0; cursor: pointer; font-weight: 600; font-size: 14px;
+    border-radius: 10px; padding: 11px 16px; color: white; margin-top: 12px;
+    background: linear-gradient(135deg, var(--accent), #6346e6);
+    transition: transform .05s ease, filter .15s ease;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:active { transform: translateY(1px); }
+  button.ghost { background: #1b2030; border: 1px solid var(--border); }
+  .row { display:flex; gap: 10px; align-items: flex-end; }
+  .row > div { flex: 1; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .results { margin-top: 26px; }
+  .result {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; margin-bottom: 10px; animation: fade .25s ease;
+  }
+  @keyframes fade { from { opacity:0; transform: translateY(6px);} to {opacity:1; transform:none;} }
+  .result .top { display:flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+  .result .txt { font-size: 15px; }
+  .score { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent-2); font-size: 13px; white-space: nowrap; }
+  .bar { height: 5px; border-radius: 4px; background: #0c0f18; margin-top: 10px; overflow: hidden; }
+  .bar > i { display:block; height:100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .meta { font-size: 11px; color: var(--muted); margin-top: 8px; font-family: ui-monospace, monospace; word-break: break-all; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: #1b2030; border:1px solid var(--border); padding: 10px 16px; border-radius: 10px;
+    font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events:none; }
+  .toast.show { opacity: 1; }
+  .links { margin-top: 30px; font-size: 13px; color: var(--muted); display:flex; gap: 18px; flex-wrap: wrap;}
+  code.k { background:#0c0f18; border:1px solid var(--border); border-radius:6px; padding:1px 6px; font-size:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="5" cy="6" r="2.2" fill="white"/><circle cx="5" cy="18" r="2.2" fill="white"/>
+        <circle cx="12" cy="12" r="2.6" fill="white"/><circle cx="19" cy="6" r="2.2" fill="white"/>
+        <circle cx="19" cy="18" r="2.2" fill="white"/>
+        <path d="M5 6L12 12L19 6M5 18L12 12L19 18" stroke="white" stroke-width="1.3" opacity=".7"/>
+      </svg>
+    </div>
+    <div>
+      <h1>Neuro<span>DB</span></h1>
+      <p class="tag">Container-native vector database &middot; semantic memory for AI</p>
+    </div>
+    <div class="status" id="status">
+      <div><span class="dot" id="statusDot"></span><span id="statusText">connecting…</span></div>
+      <div id="statusStats"></div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>1 · Remember</h2>
+      <label for="docs">Documents — one per line. NeuroDB embeds &amp; stores each.</label>
+      <textarea id="docs" placeholder="Golden retrievers are friendly, loyal dog breeds.
+Python is a popular language for data science and machine learning.
+The Eiffel Tower is a famous landmark in Paris, France.
+Vector databases store embeddings for fast semantic search."></textarea>
+      <button id="addBtn">Embed &amp; store</button>
+      <div class="hint">Stored in collection <code class="k" id="colName">demo</code>. The demo uses a built-in
+      <em>lexical</em> embedder — for true semantics, push real model embeddings to <code class="k">/vectors</code>.</div>
+    </div>
+
+    <div class="card">
+      <h2>2 · Recall</h2>
+      <label for="query">Semantic query</label>
+      <input type="text" id="query" placeholder="friendly dog breeds" />
+      <div class="row">
+        <div>
+          <label for="topk">Results (k)</label>
+          <input type="number" id="topk" value="5" min="1" max="50" />
+        </div>
+        <div>
+          <label for="apikey">API key (optional)</label>
+          <input type="text" id="apikey" placeholder="if NEURODB_API_KEY is set" />
+        </div>
+      </div>
+      <button id="searchBtn">Search</button>
+      <div class="hint">Nearest-neighbour search by cosine similarity.</div>
+    </div>
+  </div>
+
+  <div class="results" id="results"></div>
+
+  <div class="links">
+    <a href="/docs">Interactive API docs →</a>
+    <a href="/health">/health</a>
+    <a href="https://github.com/createiflabs/NeuroDB">GitHub</a>
+    <span style="margin-left:auto">© 2026 createif labs · MIT</span>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const COLLECTION = "demo";
+let EMBED_DIM = 256;
+
+function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
+function headers(){ const h={'Content-Type':'application/json'}; const k=document.getElementById('apikey').value.trim(); if(k) h['X-API-Key']=k; return h; }
+async function api(path, opts={}){ const r=await fetch(path,{headers:headers(),...opts}); if(!r.ok){ let d; try{d=await r.json();}catch(e){d={detail:r.statusText};} throw new Error(d.detail||('HTTP '+r.status)); } return r.json(); }
+
+async function refreshStatus(){
+  try{
+    const v = await fetch('/version').then(r=>r.json());
+    EMBED_DIM = v.embedding_dim || 256;
+    const h = await fetch('/health').then(r=>r.json());
+    document.getElementById('statusDot').classList.add('ok');
+    document.getElementById('statusText').textContent = 'NeuroDB v'+v.version+' online';
+    document.getElementById('statusStats').textContent = h.collections+' collections · '+h.vectors+' vectors';
+  }catch(e){
+    document.getElementById('statusText').textContent = 'offline';
+  }
+}
+
+async function ensureCollection(){
+  try { await api('/collections/'+COLLECTION); }
+  catch(e){
+    await api('/collections', {method:'POST', body: JSON.stringify({name:COLLECTION, dimension:EMBED_DIM, metric:'cosine'})});
+  }
+}
+
+document.getElementById('addBtn').onclick = async () => {
+  const lines = document.getElementById('docs').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!lines.length){ toast('Add at least one line'); return; }
+  try{
+    await ensureCollection();
+    const items = lines.map(text => ({text}));
+    const res = await api('/collections/'+COLLECTION+'/texts', {method:'POST', body: JSON.stringify({items})});
+    toast('Stored '+res.upserted+' document'+(res.upserted===1?'':'s'));
+    refreshStatus();
+  }catch(e){ toast('Error: '+e.message); }
+};
+
+document.getElementById('searchBtn').onclick = async () => {
+  const text = document.getElementById('query').value.trim();
+  const k = parseInt(document.getElementById('topk').value)||5;
+  if(!text){ toast('Type a query'); return; }
+  try{
+    await ensureCollection();
+    const res = await api('/collections/'+COLLECTION+'/search/text', {method:'POST', body: JSON.stringify({text, k})});
+    render(res.results);
+    if(!res.results.length) toast('No documents yet — store some first');
+  }catch(e){ toast('Error: '+e.message); }
+};
+
+document.getElementById('query').addEventListener('keydown', e=>{ if(e.key==='Enter') document.getElementById('searchBtn').click(); });
+
+function render(results){
+  const box = document.getElementById('results');
+  box.innerHTML = '';
+  if(!results.length) return;
+  const max = Math.max(...results.map(r=>r.score), 0.0001);
+  const min = Math.min(...results.map(r=>r.score), 0);
+  const head = document.createElement('h2');
+  head.style.cssText='font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:0 0 14px';
+  head.textContent = results.length+' matches';
+  box.appendChild(head);
+  for(const r of results){
+    const pct = Math.round(((r.score - min) / ((max - min)||1)) * 100);
+    const el = document.createElement('div');
+    el.className = 'result';
+    const text = (r.metadata && r.metadata.text) ? r.metadata.text : r.id;
+    el.innerHTML = `<div class="top"><div class="txt"></div><div class="score">${r.score.toFixed(4)}</div></div>
+      <div class="bar"><i style="width:${Math.max(8,pct)}%"></i></div>
+      <div class="meta">id: ${r.id}</div>`;
+    el.querySelector('.txt').textContent = text;
+    box.appendChild(el);
+  }
+}
+
+refreshStatus();
+</script>
+</body>
+</html>

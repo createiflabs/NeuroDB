@@ -1,0 +1,29 @@
+# VCS / CI
+.git
+.github
+.gitignore
+
+# Local virtual environments & caches
+.venv
+venv
+env
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Runtime data (never bake persisted vectors into the image)
+data
+
+# Dev-only assets not needed in the image
+tests
+examples
+Makefile
+docker-compose.yml
+.dockerignore
+Dockerfile
+
+# Docs — keep README.md (used by the build for package metadata)
+*.md
+!README.md

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neurodb"
+version = "0.1.0"
+description = "A lightweight, container-native vector database for AI memory and semantic search."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "createif labs" }]
+keywords = ["vector-database", "embeddings", "semantic-search", "ai", "similarity-search", "rag"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.4"]
+
+[project.scripts]
+neurodb = "neurodb.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/createiflabs/NeuroDB"
+Source = "https://github.com/createiflabs/NeuroDB"
+Issues = "https://github.com/createiflabs/NeuroDB/issues"
+
+[tool.setuptools.packages.find]
+include = ["neurodb*"]
+
+[tool.setuptools.package-data]
+neurodb = ["static/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+# B008: FastAPI deliberately calls Depends()/Header()/Query() in argument defaults.
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

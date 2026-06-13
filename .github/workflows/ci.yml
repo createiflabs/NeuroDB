@@ -36,15 +36,68 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
-      - name: Test (pytest)
-        run: pytest -q
+      - name: Type check (mypy)
+        run: mypy neurodb
 
-  docker:
-    name: Build & push image
+      - name: Test (pytest + coverage)
+        run: pytest --cov=neurodb --cov-report=term-missing --cov-fail-under=85
+
+      - name: Security lint (bandit)
+        if: matrix.python-version == '3.12'
+        run: bandit -q -r neurodb
+
+      - name: Dependency audit (pip-audit)
+        if: matrix.python-version == '3.12'
+        run: pip-audit --strict || true  # report-only; do not block on advisories
+
+  image-scan:
+    name: Build & scan image
     needs: test
     runs-on: ubuntu-latest
-    # Publish images for pushes to main and version tags only — never for PRs.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: neurodb:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: neurodb:scan
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: neurodb:scan
+          format: spdx-json
+          output-file: neurodb.sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: neurodb.sbom.spdx.json
+
+  publish:
+    name: Publish image
+    needs: [test, image-scan]
+    runs-on: ubuntu-latest
+    # Publish on version tags only, behind the protected `release` environment.
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release
     steps:
       - uses: actions/checkout@v4
 
@@ -66,7 +119,7 @@ jobs:
         with:
           images: createiflabs/neurodb
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
@@ -79,6 +132,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

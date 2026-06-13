@@ -40,7 +40,9 @@ def attention_weights(
 
     if X.shape[0] == 0:
         return np.empty((0,), dtype=np.float32)
-    if mask is not None and mask.any() and not mask.all():
+    # Measure similarity over the known dimensions whenever any are flagged
+    # (a full mask reduces to the full dot product).
+    if mask is not None and mask.any():
         sims = X[:, mask] @ query[mask]
     else:
         sims = X @ query
@@ -63,10 +65,13 @@ def retrieve(
     """
 
     q = query.astype(np.float32).copy()
+    # A mask with any known dimension clamps those dims (a full mask clamps all,
+    # so the result equals the input — nothing is left to complete).
+    active = mask is not None and bool(mask.any())
     weights = attention_weights(X, q, beta, mask)
     recon = (X.T @ weights).astype(np.float32)
     for _ in range(max(1, steps) - 1):
-        if mask is not None and mask.any() and not mask.all():
+        if active:
             q = recon.copy()
             q[mask] = query[mask]  # clamp the known fields, complete the rest
         else:
@@ -74,7 +79,7 @@ def retrieve(
         weights = attention_weights(X, q, beta, mask)
         recon = (X.T @ weights).astype(np.float32)
 
-    if mask is not None and mask.any() and not mask.all():
+    if active:
         completed = recon.copy()
         completed[mask] = query[mask]
         return completed, weights

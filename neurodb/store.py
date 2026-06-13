@@ -186,6 +186,8 @@ class Memory:
         self.metadata: list[dict[str, Any]] = []
         self._index: dict[str, int] = {}
         self._X = np.zeros((0, self.dimension), dtype=np.float32)
+        # Cached per-row L2 norms for cosine search; invalidated on mutation.
+        self._norms: np.ndarray | None = None
         self._lock = threading.RLock()
         # Monotonic write version vs. the version last persisted. A memory is
         # dirty when they differ. This (rather than a bare bool) means a write
@@ -282,6 +284,7 @@ class Memory:
                 self.ids.extend(new_ids)
                 self.metadata.extend(new_meta)
 
+            self._norms = None  # invalidate cached norms
             self._version += 1
             return list(affected)
 
@@ -310,19 +313,26 @@ class Memory:
             self.ids = [i for j, i in enumerate(self.ids) if mask[j]]
             self.metadata = [m for j, m in enumerate(self.metadata) if mask[j]]
             self._index = {i: j for j, i in enumerate(self.ids)}
+            self._norms = None  # invalidate cached norms
             self._version += 1
             return len(targets)
 
     # -- content-addressable operations ----------------------------------
-    def _contributors(self, weights: np.ndarray, top_k: int) -> list[dict[str, Any]]:
-        n = weights.shape[0]
-        if n == 0:
-            return []
-        k = min(max(top_k, 0), n)
+    @staticmethod
+    def _top_k_indices(scores: np.ndarray, k: int) -> np.ndarray:
+        """Indices of the ``k`` highest scores, descending, ties broken stably."""
+
+        n = scores.shape[0]
+        k = min(max(k, 0), n)
         if k == 0:
+            return np.empty((0,), dtype=np.int64)
+        top = np.argpartition(-scores, k - 1)[:k]
+        return top[np.argsort(-scores[top], kind="stable")]
+
+    def _contributors(self, weights: np.ndarray, top_k: int) -> list[dict[str, Any]]:
+        if weights.shape[0] == 0:
             return []
-        top = np.argpartition(-weights, k - 1)[:k]
-        top = top[np.argsort(-weights[top], kind="stable")]
+        top = self._top_k_indices(weights, top_k)
         return [
             {
                 "id": self.ids[int(i)],
@@ -373,15 +383,21 @@ class Memory:
         k: int = 10,
         flt: dict[str, Any] | None = None,
         include_vectors: bool = False,
+        metric: str = "cosine",
     ) -> list[dict[str, Any]]:
-        """Nearest stored patterns by cosine similarity."""
+        """Nearest stored patterns by similarity (cosine by default)."""
 
         with self._lock:
             n = self._X.shape[0]
             if n == 0 or k <= 0:
                 return []
             q = self._coerce_vector(query)
-            scores = compute_scores(self._X, q, "cosine")
+            if metric == "cosine":
+                if self._norms is None:
+                    self._norms = np.linalg.norm(self._X, axis=1).astype(np.float32)
+                scores = compute_scores(self._X, q, metric, norms=self._norms)
+            else:
+                scores = compute_scores(self._X, q, metric)
             if flt:
                 validate_filter(flt)
                 keep = np.fromiter(
@@ -390,9 +406,7 @@ class Memory:
                 if not keep.any():
                     return []
                 scores = np.where(keep, scores, -np.inf)
-            limit = min(k, n)
-            top = np.argpartition(-scores, limit - 1)[:limit]
-            top = top[np.argsort(-scores[top], kind="stable")]
+            top = self._top_k_indices(scores, k)
             results: list[dict[str, Any]] = []
             for i in top:
                 i = int(i)

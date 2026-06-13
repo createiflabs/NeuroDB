@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -80,6 +80,7 @@ class SearchRequest(BaseModel):
     k: int = Field(10, gt=0, le=1000)
     filter: dict[str, Any] | None = None
     include_vectors: bool = False
+    metric: Literal["cosine", "dot", "euclidean"] = "cosine"
 
 
 class AnomalyRequest(BaseModel):

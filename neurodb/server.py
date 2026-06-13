@@ -298,7 +298,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def search(name: str, body: SearchRequest):
         mem = store.get_memory(name)
         results = await run_in_threadpool(
-            mem.search, body.query, body.k, body.filter, body.include_vectors
+            mem.search, body.query, body.k, body.filter, body.include_vectors, body.metric
         )
         return {"results": results, "count": len(results)}
 

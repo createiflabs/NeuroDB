@@ -17,12 +17,21 @@ def _normalize(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def compute_scores(matrix: np.ndarray, query: np.ndarray, metric: str) -> np.ndarray:
+def compute_scores(
+    matrix: np.ndarray,
+    query: np.ndarray,
+    metric: str,
+    norms: np.ndarray | None = None,
+) -> np.ndarray:
     """Return a 1-D array of similarity scores for ``query`` against ``matrix``.
 
     ``matrix`` has shape ``(N, D)`` and ``query`` has shape ``(D,)``. Higher
     scores are always better. For ``euclidean`` the score is the negative L2
     distance so that the ranking direction matches the other metrics.
+
+    For ``cosine``, precomputed per-row ``norms`` (shape ``(N,)``) may be passed
+    to avoid re-normalizing the whole matrix on every query — the caller is
+    responsible for keeping them in sync with ``matrix``.
     """
 
     if matrix.shape[0] == 0:
@@ -32,9 +41,12 @@ def compute_scores(matrix: np.ndarray, query: np.ndarray, metric: str) -> np.nda
     query = query.astype(np.float32, copy=False).reshape(-1)
 
     if metric == "cosine":
-        normed = _normalize(matrix)
-        q = query / (np.linalg.norm(query) or 1.0)
-        return (normed @ q).astype(np.float32)
+        # cos(x, q) = (x · q) / (|x| |q|) — one matvec + an elementwise divide,
+        # with no full-matrix normalization allocation per query.
+        qnorm = float(np.linalg.norm(query)) or 1.0
+        row_norms = np.linalg.norm(matrix, axis=1) if norms is None else norms
+        denom = np.where(row_norms == 0.0, 1.0, row_norms) * qnorm
+        return ((matrix @ query) / denom).astype(np.float32)
     if metric == "dot":
         return (matrix @ query).astype(np.float32)
     if metric == "euclidean":

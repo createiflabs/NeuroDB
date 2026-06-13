@@ -32,6 +32,10 @@ retrieval-augmented generation (RAG), recommendations and deduplication.
 ### 🐳 Docker (recommended)
 
 ```bash
+# GitHub Container Registry (published by CI on every push to main):
+docker run -d --name neurodb -p 8000:8000 -v neurodb_data:/data ghcr.io/createiflabs/neurodb:latest
+
+# Docker Hub (published once the DOCKERHUB_TOKEN secret is configured):
 docker run -d --name neurodb -p 8000:8000 -v neurodb_data:/data createiflabs/neurodb:latest
 ```
 

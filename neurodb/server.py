@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from . import __version__
@@ -34,6 +34,7 @@ from .models import (
     TextWriteRequest,
     WriteRequest,
 )
+from .observability import CONTENT_TYPE_LATEST, Metrics, request_id_var
 from .store import MemoryError_, NeuroStore, NotFoundError, StoreError
 
 logger = logging.getLogger("neurodb")
@@ -100,23 +101,26 @@ class _FixedWindowLimiter:
             return count <= self.limit
 
 
-async def _autosave_loop(store: NeuroStore, interval: float) -> None:
+async def _autosave_loop(store: NeuroStore, interval: float, metrics: Metrics) -> None:
     if interval <= 0:
         return
     while True:
         try:
             await asyncio.sleep(interval)
             if await run_in_threadpool(store.flush):
+                metrics.record_save(True)
                 logger.debug("autosave: persisted store")
         except asyncio.CancelledError:
             raise
         except Exception:  # pragma: no cover - keep the loop alive
+            metrics.record_save(False)
             logger.exception("autosave loop error")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     store = NeuroStore(settings.data_file, fail_on_corrupt_load=settings.fail_on_corrupt_load)
+    metrics = Metrics()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -133,7 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "(NEURODB_ALLOW_ANONYMOUS); do not expose it to untrusted networks."
             )
         logger.info("NeuroDB %s starting (data_file=%s)", __version__, settings.data_file)
-        task = asyncio.create_task(_autosave_loop(store, settings.autosave_interval))
+        task = asyncio.create_task(_autosave_loop(store, settings.autosave_interval, metrics))
         try:
             yield
         finally:
@@ -214,11 +218,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _request_context(request, call_next):
         rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
         request.state.request_id = rid
-        response = await call_next(request)
+        token = request_id_var.set(rid)
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
+        duration = time.perf_counter() - start
+        route = request.scope.get("route")
+        label = getattr(route, "path", "unmatched")
+        metrics.observe_request(request.method, label, response.status_code, duration)
         response.headers["X-Request-ID"] = rid
         # Nudge clients off the unversioned (legacy) data routes.
-        path = request.url.path
-        if _is_legacy_data_path(path):
+        if _is_legacy_data_path(request.url.path):
             response.headers["Deprecation"] = "true"
             response.headers["Link"] = '</v1>; rel="successor-version"'
         return response
@@ -275,6 +287,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health", tags=["system"])
     async def health():
+        # Liveness + lightweight counts (used by the dashboard).
         stats = store.stats()
         return {
             "status": "ok",
@@ -282,6 +295,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "memories": stats["memories"],
             "patterns": stats["patterns"],
         }
+
+    @app.get("/ready", tags=["system"])
+    async def ready():
+        # Readiness for load balancers: 503 until the last persist succeeded.
+        if store.last_save_ok:
+            return {"status": "ready"}
+        return JSONResponse(status_code=503, content={"status": "not ready"})
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint():
+        stats = store.stats()
+        body = metrics.render(stats["memories"], stats["patterns"])
+        return Response(content=body, media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/version", tags=["system"])
     async def version():

@@ -543,6 +543,8 @@ class NeuroStore:
         self.fail_on_corrupt_load = fail_on_corrupt_load
         self._memories: dict[str, Memory] = {}
         self._lock = threading.RLock()
+        # Readiness signal: did the most recent persist succeed?
+        self.last_save_ok = True
         self.load()
 
     # -- memory lifecycle -------------------------------------------------
@@ -659,6 +661,14 @@ class NeuroStore:
             )
 
     def save(self) -> None:
+        try:
+            self._save_locked()
+        except Exception:
+            self.last_save_ok = False
+            raise
+        self.last_save_ok = True
+
+    def _save_locked(self) -> None:
         with self._lock:
             self.data_file.parent.mkdir(parents=True, exist_ok=True)
             mems = list(self._memories.values())

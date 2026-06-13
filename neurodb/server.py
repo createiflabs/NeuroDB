@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -43,6 +45,35 @@ DESCRIPTION = (
 )
 
 
+_RATE_LIMIT_EXEMPT = frozenset({"/", "/health", "/version", "/metrics", "/ready"})
+
+
+class _FixedWindowLimiter:
+    """A small in-process fixed-window rate limiter (per client key).
+
+    Adequate for the single-node deployment target; swap for a shared backend
+    if NeuroDB is ever run as multiple instances behind a load balancer.
+    """
+
+    def __init__(self, limit_per_minute: int) -> None:
+        self.limit = limit_per_minute
+        self._lock = threading.Lock()
+        self._counts: dict[tuple[str, int], int] = {}
+
+    def allow(self, key: str, now: float) -> bool:
+        if self.limit <= 0:
+            return True
+        window = int(now // 60)
+        with self._lock:
+            count = self._counts.get((key, window), 0) + 1
+            self._counts[(key, window)] = count
+            if len(self._counts) > 10_000:  # opportunistic cleanup
+                self._counts = {
+                    k: v for k, v in self._counts.items() if k[1] == window
+                }
+            return count <= self.limit
+
+
 async def _autosave_loop(store: NeuroStore, interval: float) -> None:
     if interval <= 0:
         return
@@ -59,10 +90,22 @@ async def _autosave_loop(store: NeuroStore, interval: float) -> None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    store = NeuroStore(settings.data_file)
+    store = NeuroStore(settings.data_file, fail_on_corrupt_load=settings.fail_on_corrupt_load)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Fail-closed: never serve an internet-facing instance without auth
+        # unless the operator explicitly opted into anonymous access.
+        if not settings.api_key and not settings.allow_anonymous:
+            raise RuntimeError(
+                "Refusing to start without authentication. Set NEURODB_API_KEY, "
+                "or set NEURODB_ALLOW_ANONYMOUS=1 to allow anonymous access."
+            )
+        if not settings.api_key:
+            logger.warning(
+                "NeuroDB is running WITHOUT authentication "
+                "(NEURODB_ALLOW_ANONYMOUS); do not expose it to untrusted networks."
+            )
         logger.info("NeuroDB %s starting (data_file=%s)", __version__, settings.data_file)
         task = asyncio.create_task(_autosave_loop(store, settings.autosave_interval))
         try:
@@ -87,13 +130,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.store = store
     app.state.settings = settings
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # CORS is closed by default; only enabled for explicitly configured origins.
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    limiter = _FixedWindowLimiter(settings.rate_limit_per_minute)
+
+    @app.middleware("http")
+    async def _security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'",
+        )
+        return response
+
+    @app.middleware("http")
+    async def _rate_limit(request, call_next):
+        if (
+            settings.rate_limit_per_minute > 0
+            and request.url.path not in _RATE_LIMIT_EXEMPT
+        ):
+            client = request.client.host if request.client else "anon"
+            key = request.headers.get("X-API-Key") or client
+            if not limiter.allow(key, time.monotonic()):
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded."},
+                    headers={"Retry-After": "60"},
+                )
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def _limit_body_size(request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > settings.max_request_bytes:
+                    return JSONResponse(
+                        status_code=413, content={"detail": "Request body too large."}
+                    )
+            except ValueError:
+                pass
+        return await call_next(request)
 
     @app.exception_handler(NotFoundError)
     async def _not_found(_request, exc: NotFoundError):

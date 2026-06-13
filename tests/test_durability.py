@@ -40,7 +40,7 @@ def test_save_fsyncs_before_replace(store_factory, monkeypatch):
 
 def test_flush_endpoint_makes_writes_durable(tmp_path):
     path = tmp_path / "db.npz"
-    settings = Settings(data_file=str(path), autosave_interval=0.0)
+    settings = Settings(data_file=str(path), autosave_interval=0.0, allow_anonymous=True)
     with TestClient(create_app(settings)) as client:
         client.post("/memories", json={"name": "m", "dimension": 2})
         client.post("/memories/m/patterns", json={"items": [{"id": "a", "vector": [1, 0]}]})
@@ -58,7 +58,7 @@ def test_flush_endpoint_makes_writes_durable(tmp_path):
 def test_write_without_flush_is_not_yet_persisted(tmp_path):
     # Documents the bounded loss window: autosave off + no flush => not on disk.
     path = tmp_path / "db.npz"
-    settings = Settings(data_file=str(path), autosave_interval=0.0)
+    settings = Settings(data_file=str(path), autosave_interval=0.0, allow_anonymous=True)
     app = create_app(settings)
     with TestClient(app) as client:
         client.post("/memories", json={"name": "m", "dimension": 2})

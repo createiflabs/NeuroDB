@@ -110,9 +110,9 @@ def client_factory(settings_factory) -> Callable[..., TestClient]:
 
 @pytest.fixture()
 def client(client_factory) -> TestClient:
-    """Default anonymous client (no API key)."""
+    """Default anonymous client (auth explicitly disabled for convenience)."""
 
-    return client_factory()
+    return client_factory(allow_anonymous=True)
 
 
 @pytest.fixture()

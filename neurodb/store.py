@@ -564,9 +564,18 @@ class NeuroStore:
         except KeyError:
             raise NotFoundError(f"Memory {name!r} not found.") from None
 
-    def list_memories(self) -> list[dict[str, Any]]:
+    def list_memories(
+        self, limit: int | None = None, offset: int = 0
+    ) -> list[dict[str, Any]]:
         with self._lock:
-            return [mem.info() for mem in self._memories.values()]
+            infos = [mem.info() for mem in self._memories.values()]
+            if limit is None:
+                return infos
+            return infos[offset : offset + limit]
+
+    def count_memories(self) -> int:
+        with self._lock:
+            return len(self._memories)
 
     def delete_memory(self, name: str) -> None:
         with self._lock:

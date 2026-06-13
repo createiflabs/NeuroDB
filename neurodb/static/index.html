@@ -170,8 +170,8 @@ async function refreshStatus(){
 }
 
 async function ensureMemory(){
-  try { await api('/memories/'+MEMORY); }
-  catch(e){ await api('/memories', {method:'POST', body: JSON.stringify({name:MEMORY, dimension:EMBED_DIM, beta:8})}); }
+  try { await api('/v1/memories/'+MEMORY); }
+  catch(e){ await api('/v1/memories', {method:'POST', body: JSON.stringify({name:MEMORY, dimension:EMBED_DIM, beta:8})}); }
 }
 
 document.getElementById('addBtn').onclick = async () => {
@@ -179,7 +179,7 @@ document.getElementById('addBtn').onclick = async () => {
   if(!lines.length){ toast('Add at least one line'); return; }
   try{
     await ensureMemory();
-    const res = await api('/memories/'+MEMORY+'/texts', {method:'POST', body: JSON.stringify({items: lines.map(text=>({text}))})});
+    const res = await api('/v1/memories/'+MEMORY+'/texts', {method:'POST', body: JSON.stringify({items: lines.map(text=>({text}))})});
     toast('Appended '+res.written+' memor'+(res.written===1?'y':'ies'));
     refreshStatus();
   }catch(e){ toast('Error: '+e.message); }
@@ -191,7 +191,7 @@ document.getElementById('searchBtn').onclick = async () => {
   if(!text){ toast('Type a cue'); return; }
   try{
     await ensureMemory();
-    const res = await api('/memories/'+MEMORY+'/recall/text', {method:'POST', body: JSON.stringify({text, k})});
+    const res = await api('/v1/memories/'+MEMORY+'/recall/text', {method:'POST', body: JSON.stringify({text, k})});
     render(res.weights||[]);
     if(!(res.weights||[]).length) toast('No memories yet — write some first');
   }catch(e){ toast('Error: '+e.message); }

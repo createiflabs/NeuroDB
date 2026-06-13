@@ -10,10 +10,13 @@ import hmac
 import logging
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -46,6 +49,29 @@ DESCRIPTION = (
 
 
 _RATE_LIMIT_EXEMPT = frozenset({"/", "/health", "/version", "/metrics", "/ready"})
+_LEGACY_DATA_PREFIXES = ("/memories", "/stats", "/flush", "/embed")
+
+
+def _is_legacy_data_path(path: str) -> bool:
+    """True for an unversioned data path (i.e. not already under /v1)."""
+
+    return any(path == p or path.startswith(p + "/") for p in _LEGACY_DATA_PREFIXES)
+
+
+def _error_response(request, status: int, code: str, message, **extra) -> JSONResponse:
+    """Consistent error envelope carrying a request id.
+
+    Keeps a top-level ``detail`` mirror for backward compatibility with
+    existing clients (and the dashboard) that read ``detail``.
+    """
+
+    request_id = getattr(getattr(request, "state", None), "request_id", None)
+    body = {
+        "error": {"code": code, "message": message, "request_id": request_id, **extra},
+        "detail": message,
+    }
+    headers = {"X-Request-ID": request_id} if request_id else None
+    return JSONResponse(status_code=status, content=body, headers=headers)
 
 
 class _FixedWindowLimiter:
@@ -184,13 +210,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 pass
         return await call_next(request)
 
+    @app.middleware("http")
+    async def _request_context(request, call_next):
+        rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        request.state.request_id = rid
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = rid
+        # Nudge clients off the unversioned (legacy) data routes.
+        path = request.url.path
+        if _is_legacy_data_path(path):
+            response.headers["Deprecation"] = "true"
+            response.headers["Link"] = '</v1>; rel="successor-version"'
+        return response
+
     @app.exception_handler(NotFoundError)
-    async def _not_found(_request, exc: NotFoundError):
-        return JSONResponse(status_code=404, content={"detail": str(exc)})
+    async def _not_found(request, exc: NotFoundError):
+        return _error_response(request, 404, "not_found", str(exc))
 
     @app.exception_handler(StoreError)
-    async def _store_error(_request, exc: StoreError):
-        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    async def _store_error(request, exc: StoreError):
+        return _error_response(request, 400, "bad_request", str(exc))
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request, exc: RequestValidationError):
+        return _error_response(
+            request,
+            422,
+            "validation_error",
+            "Request validation failed.",
+            errors=jsonable_encoder(exc.errors()),
+        )
+
+    @app.exception_handler(HTTPException)
+    async def _http_error(request, exc: HTTPException):
+        return _error_response(request, exc.status_code, "http_error", exc.detail)
+
+    @app.exception_handler(Exception)
+    async def _unhandled(request, exc: Exception):
+        logger.exception(
+            "unhandled error [request_id=%s]", getattr(request.state, "request_id", None)
+        )
+        return _error_response(request, 500, "internal_error", "Internal server error.")
 
     async def require_api_key(
         x_api_key: str | None = Header(None, alias="X-API-Key"),
@@ -254,8 +314,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return mem.info()
 
     @api.get("/memories", tags=["memories"])
-    async def list_memories():
-        return {"memories": store.list_memories()}
+    async def list_memories(
+        limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)
+    ):
+        return {
+            "memories": store.list_memories(limit, offset),
+            "total": store.count_memories(),
+            "limit": limit,
+            "offset": offset,
+        }
 
     @api.get("/memories/{name}", tags=["memories"])
     async def get_memory(name: str):
@@ -359,7 +426,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         vector = embed_text(body.text, settings.embedding_dim)
         return {"vector": vector.tolist(), "dimension": settings.embedding_dim}
 
-    app.include_router(api)
+    # Versioned API plus an unversioned legacy alias (deprecation headers added
+    # by the request-context middleware). The legacy mount is hidden from the
+    # OpenAPI schema so /v1 is the single documented surface.
+    app.include_router(api, prefix="/v1")
+    app.include_router(api, include_in_schema=False)
     return app
 
 

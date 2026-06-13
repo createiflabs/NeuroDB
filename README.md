@@ -77,7 +77,7 @@ temperature `beta`, and optional per-dimension `fields` (handy for anomaly
 reports on structured records).
 
 ```bash
-curl -X POST localhost:8000/memories -H 'content-type: application/json' -d '{
+curl -X POST localhost:8000/v1/memories -H 'content-type: application/json' -d '{
   "name": "sensors", "dimension": 3, "beta": 12,
   "fields": ["temperature", "humidity", "pressure"]
 }'
@@ -86,7 +86,7 @@ curl -X POST localhost:8000/memories -H 'content-type: application/json' -d '{
 ### Write patterns (append vectors)
 
 ```bash
-curl -X POST localhost:8000/memories/sensors/patterns -H 'content-type: application/json' -d '{
+curl -X POST localhost:8000/v1/memories/sensors/patterns -H 'content-type: application/json' -d '{
   "items": [
     {"vector": [20, 50, 1013]}, {"vector": [21, 52, 1012]},
     {"vector": [19, 48, 1014]}, {"vector": [20, 51, 1013]}
@@ -100,7 +100,7 @@ Know only the temperature? Mark dimension `0` as known and let NeuroDB complete
 the rest:
 
 ```bash
-curl -X POST localhost:8000/memories/sensors/complete -H 'content-type: application/json' \
+curl -X POST localhost:8000/v1/memories/sensors/complete -H 'content-type: application/json' \
   -d '{"query": [20, 0, 0], "mask": [0]}'
 # → reconstruction ≈ [20.0, 51.9, 1012.9]
 ```
@@ -108,7 +108,7 @@ curl -X POST localhost:8000/memories/sensors/complete -H 'content-type: applicat
 ### Per-field anomaly detection
 
 ```bash
-curl -X POST localhost:8000/memories/sensors/anomaly -H 'content-type: application/json' \
+curl -X POST localhost:8000/v1/memories/sensors/anomaly -H 'content-type: application/json' \
   -d '{"query": [20, 95, 1013]}'
 # → score 47.0; top field {"name": "humidity", "value": 95, "expected": 48, "deviation": 47}
 ```
@@ -116,7 +116,7 @@ curl -X POST localhost:8000/memories/sensors/anomaly -H 'content-type: applicati
 ### Similarity search
 
 ```bash
-curl -X POST localhost:8000/memories/sensors/search -H 'content-type: application/json' \
+curl -X POST localhost:8000/v1/memories/sensors/search -H 'content-type: application/json' \
   -d '{"query": [20, 50, 1013], "k": 3}'
 ```
 
@@ -134,12 +134,12 @@ def call(path, body):
         data=json.dumps(body).encode(), headers={"content-type": "application/json"})
     return json.load(urllib.request.urlopen(req))
 
-call("/memories", {"name": "kb", "dimension": dim, "beta": 16})
+call("/v1/memories", {"name": "kb", "dimension": dim, "beta": 16})
 docs = ["NeuroDB recalls patterns by content.", "Paris is the capital of France."]
-call("/memories/kb/patterns", {"items": [
+call("/v1/memories/kb/patterns", {"items": [
     {"id": str(i), "vector": model.encode(d).tolist(), "metadata": {"text": d}}
     for i, d in enumerate(docs)]})
-hit = call("/memories/kb/complete", {"query": model.encode("memory by content").tolist()})
+hit = call("/v1/memories/kb/complete", {"query": model.encode("memory by content").tolist()})
 print(hit["top"]["metadata"]["text"])
 ```
 
@@ -149,15 +149,99 @@ For zero-setup demos, NeuroDB ships a lightweight lexical embedder. Create a
 memory whose dimension matches it (`256` by default) and push text directly:
 
 ```bash
-curl -X POST localhost:8000/memories/demo/texts -H 'content-type: application/json' \
+curl -X POST localhost:8000/v1/memories/demo/texts -H 'content-type: application/json' \
   -d '{"items": [{"text": "golden retrievers are friendly dogs"}]}'
 
-curl -X POST localhost:8000/memories/demo/recall/text -H 'content-type: application/json' \
+curl -X POST localhost:8000/v1/memories/demo/recall/text -H 'content-type: application/json' \
   -d '{"text": "friendly puppy", "k": 3}'   # returns the attention distribution
 ```
 
 > The built-in embedder is *lexical*, not neural — great for demos, but for real
 > semantics generate embeddings with your own model and push raw vectors.
+
+---
+
+## Use cases
+
+Four primitives — recall, completion, anomaly, search — cover a wide range of
+jobs. The snippets below reuse the `call()` helper and an `embed(text) →
+list[float]` from [Bring your own embeddings](#bring-your-own-embeddings-python).
+
+### 🧠 Long-term memory for AI agents
+
+Give an agent a content-addressable memory: it appends observations as vectors
+and later recalls the most relevant one by *meaning*, not by key. `/complete`
+(or `/recall/text`) returns the recalled item plus an attention distribution —
+how strongly the cue matches each stored memory.
+
+```python
+call("/v1/memories", {"name": "agent", "dimension": dim, "beta": 16})
+call("/v1/memories/agent/patterns", {"items": [
+    {"id": "m1", "vector": embed("user prefers dark mode"),  "metadata": {"note": "user prefers dark mode"}},
+    {"id": "m2", "vector": embed("we deploy every Friday"),  "metadata": {"note": "we deploy every Friday"}},
+]})
+hit = call("/v1/memories/agent/complete", {"query": embed("when do we ship?")})
+print(hit["top"]["metadata"]["note"])      # → "we deploy every Friday"
+```
+
+### 🔎 RAG / semantic retrieval
+
+Store document-chunk embeddings with metadata, then fetch the most relevant
+chunks to ground an LLM answer. Metadata filters scope the search — per tenant,
+per source, by recency:
+
+```bash
+curl -X POST localhost:8000/v1/memories/docs/search -H 'content-type: application/json' -d '{
+  "query": [/* query embedding */], "k": 5,
+  "filter": {"tenant": "acme", "year": {"$gte": 2024}}
+}'
+```
+
+### 🧩 Record completion & imputation
+
+Fill the missing fields of a partial record from the nearest stored prototypes —
+a sensor reading with a dead channel, a half-filled form, a sparse profile. Mark
+the *known* dimensions; the Hopfield step completes the rest:
+
+```bash
+# Known: temperature only (dim 0). NeuroDB infers humidity + pressure.
+curl -X POST localhost:8000/v1/memories/sensors/complete -H 'content-type: application/json' \
+  -d '{"query": [20, 0, 0], "mask": [0]}'        # → ≈ [20.0, 51.9, 1012.9]
+```
+
+### 🚨 Anomaly & fault detection
+
+Recall the "normal" pattern an input *should* resemble, then report exactly
+which fields deviate and by how much — telemetry drift, fraud features, server
+metrics. Name the dimensions and the report reads in plain English:
+
+```bash
+curl -X POST localhost:8000/v1/memories/sensors/anomaly -H 'content-type: application/json' \
+  -d '{"query": [20, 95, 1013]}'
+# → top field {"name": "humidity", "expected": 48, "value": 95, "deviation": 47}
+```
+
+### 🪞 Deduplication & "more like this"
+
+Before inserting, search for the nearest existing vector — a near-`1.0` cosine
+score means a likely duplicate. The same query powers item-to-item
+recommendations ("more like this"), optionally scoped by a metadata `filter`:
+
+```bash
+curl -X POST localhost:8000/v1/memories/catalog/search -H 'content-type: application/json' \
+  -d '{"query": [/* item embedding */], "k": 1}'
+# score ≈ 1.0 → near-duplicate; lower → genuinely novel
+```
+
+### ✨ Canonicalization & fuzzy lookup
+
+Snap a noisy or partial query to the closest canonical entry — normalize a messy
+address, product name, or SKU to a known record. Store the canonical forms, then
+recall with a high `beta` so the result snaps to the single best match.
+
+> **Choosing `beta`:** high `beta` (≈ 16–50) gives crisp, single-match recall
+> (memory, dedup, canonicalization); low `beta` returns a soft blend of related
+> patterns (useful for smoothing or "average of similar records").
 
 ---
 

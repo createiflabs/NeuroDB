@@ -23,7 +23,7 @@ RUN pip install --no-deps .
 FROM python:3.12-slim AS runtime
 
 LABEL org.opencontainers.image.title="NeuroDB" \
-      org.opencontainers.image.description="Lightweight, container-native vector database for AI memory and semantic search." \
+      org.opencontainers.image.description="Content-addressable store powered by Modern Hopfield networks: pattern completion, per-field anomaly detection, similarity search, single-file persistence." \
       org.opencontainers.image.source="https://github.com/createiflabs/NeuroDB" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="createif labs"
@@ -31,7 +31,7 @@ LABEL org.opencontainers.image.title="NeuroDB" \
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
-    NEURODB_DATA_DIR=/data \
+    NEURODB_DATA_FILE=/data/neurodb.npz \
     NEURODB_HOST=0.0.0.0 \
     NEURODB_PORT=8000
 

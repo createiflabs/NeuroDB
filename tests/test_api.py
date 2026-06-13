@@ -7,93 +7,86 @@ from neurodb.server import create_app
 
 @pytest.fixture()
 def client(tmp_path):
-    settings = Settings(data_dir=str(tmp_path), autosave_interval=0.0)
+    settings = Settings(data_file=str(tmp_path / "db.npz"), autosave_interval=0.0)
     with TestClient(create_app(settings)) as test_client:
         yield test_client
 
 
-def test_health_is_public(client):
-    response = client.get("/health")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "ok"
-    assert "version" in body
+def test_health_and_version(client):
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+    version = client.get("/version").json()
+    assert version["engine"] == "modern-hopfield"
 
 
-def test_collection_crud_and_vector_search(client):
-    created = client.post("/collections", json={"name": "docs", "dimension": 3, "metric": "cosine"})
+def test_write_search_and_complete(client):
+    created = client.post("/memories", json={"name": "m", "dimension": 3, "beta": 30})
     assert created.status_code == 201, created.text
-    assert created.json()["count"] == 0
+    assert created.json()["beta"] == 30
 
-    upserted = client.post(
-        "/collections/docs/vectors",
-        json={
-            "items": [
-                {"id": "a", "vector": [1, 0, 0], "metadata": {"t": "a"}},
-                {"id": "b", "vector": [0, 1, 0], "metadata": {"t": "b"}},
-            ]
-        },
+    written = client.post(
+        "/memories/m/patterns",
+        json={"items": [{"id": "a", "vector": [1, 0, 0]}, {"id": "b", "vector": [0, 1, 0]}]},
     )
-    assert upserted.status_code == 200
-    assert upserted.json()["upserted"] == 2
+    assert written.json()["written"] == 2
 
-    found = client.post("/collections/docs/search", json={"vector": [1, 0, 0], "k": 1})
-    assert found.status_code == 200
-    results = found.json()["results"]
-    assert results[0]["id"] == "a"
+    search = client.post("/memories/m/search", json={"query": [1, 0, 0], "k": 1})
+    assert search.json()["results"][0]["id"] == "a"
 
-    listing = client.get("/collections")
-    assert listing.json()["collections"][0]["name"] == "docs"
+    complete = client.post("/memories/m/complete", json={"query": [0.8, 0.2, 0]})
+    body = complete.json()
+    assert body["top"]["id"] == "a"
+    assert len(body["reconstruction"]) == 3
 
 
-def test_text_endpoints_rank_semantically(client):
-    dim = client.get("/version").json()["embedding_dim"]
-    client.post("/collections", json={"name": "mem", "dimension": dim, "metric": "cosine"})
-
-    docs = [
-        "the cat sat on the mat",
-        "dogs are loyal animals",
-        "a feline rested on the rug",
-    ]
+def test_anomaly_endpoint_names_field(client):
     client.post(
-        "/collections/mem/texts",
-        json={"items": [{"text": d} for d in docs]},
+        "/memories",
+        json={"name": "r", "dimension": 3, "beta": 30, "fields": ["age", "income", "score"]},
     )
-
-    response = client.post(
-        "/collections/mem/search/text", json={"text": "a cat on the rug", "k": 3}
+    client.post(
+        "/memories/r/patterns",
+        json={"items": [{"vector": [1, 1, 1]}, {"vector": [1, 1, 1]}]},
     )
-    assert response.status_code == 200
-    results = response.json()["results"]
-    assert len(results) == 3
-    ranked = [r["metadata"]["text"] for r in results]
-    # The unrelated "dogs" document should rank last.
-    assert ranked[-1] == "dogs are loyal animals"
+    anomaly = client.post("/memories/r/anomaly", json={"query": [1, 5, 1]}).json()
+    assert anomaly["fields"][0]["name"] == "income"
+    assert anomaly["score"] > 0
 
 
-def test_missing_collection_returns_404(client):
-    assert client.get("/collections/nope").status_code == 404
+def test_text_endpoints_recall(client):
+    dim = client.get("/version").json()["embedding_dim"]
+    client.post("/memories", json={"name": "mem", "dimension": dim, "beta": 8})
+    docs = [
+        "golden retrievers are friendly loyal dogs",
+        "python is a popular programming language",
+        "the eiffel tower stands in paris france",
+    ]
+    client.post("/memories/mem/texts", json={"items": [{"text": d} for d in docs]})
+
+    search = client.post("/memories/mem/search/text", json={"text": "friendly dog", "k": 3}).json()
+    assert search["results"][0]["metadata"]["text"] == "golden retrievers are friendly loyal dogs"
+
+    recall = client.post("/memories/mem/recall/text", json={"text": "friendly dog", "k": 3}).json()
+    assert recall["top"]["metadata"]["text"] == "golden retrievers are friendly loyal dogs"
+    assert 0.0 <= recall["top"]["weight"] <= 1.0
+
+
+def test_missing_memory_returns_404(client):
+    assert client.get("/memories/nope").status_code == 404
 
 
 def test_dimension_mismatch_returns_400(client):
-    client.post("/collections", json={"name": "c", "dimension": 3})
-    response = client.post("/collections/c/vectors", json={"items": [{"vector": [1, 0]}]})
+    client.post("/memories", json={"name": "m", "dimension": 3})
+    response = client.post("/memories/m/patterns", json={"items": [{"vector": [1, 0]}]})
     assert response.status_code == 400
 
 
-def test_delete_vector(client):
-    client.post("/collections", json={"name": "c", "dimension": 2})
-    client.post("/collections/c/vectors", json={"items": [{"id": "x", "vector": [1, 0]}]})
-    assert client.delete("/collections/c/vectors/x").status_code == 200
-    assert client.get("/collections/c/vectors/x").status_code == 404
-
-
 def test_api_key_protects_data_routes(tmp_path):
-    settings = Settings(data_dir=str(tmp_path), autosave_interval=0.0, api_key="secret")
+    settings = Settings(data_file=str(tmp_path / "db.npz"), autosave_interval=0.0, api_key="secret")
     with TestClient(create_app(settings)) as client:
-        assert client.get("/health").status_code == 200  # public
-        assert client.get("/collections").status_code == 401  # protected, no key
-        ok = client.get("/collections", headers={"X-API-Key": "secret"})
-        assert ok.status_code == 200
-        bearer = client.get("/collections", headers={"Authorization": "Bearer secret"})
+        assert client.get("/health").status_code == 200
+        assert client.get("/memories").status_code == 401
+        assert client.get("/memories", headers={"X-API-Key": "secret"}).status_code == 200
+        bearer = client.get("/memories", headers={"Authorization": "Bearer secret"})
         assert bearer.status_code == 200

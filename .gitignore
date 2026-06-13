@@ -19,9 +19,10 @@ env/
 .coverage
 htmlcov/
 
-# NeuroDB runtime data (persisted vectors)
+# NeuroDB runtime data (single-file persistence)
 data/
 *.npy
+*.npz
 
 # Editors / OS
 .vscode/

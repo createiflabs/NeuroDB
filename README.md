@@ -2,7 +2,9 @@
 
 # 🧠 NeuroDB
 
-**A lightweight, container-native vector database for AI memory and semantic search.**
+**A content-addressable store powered by Modern Hopfield networks.**
+
+*Writing a pattern is appending a vector. Retrieval is a single attention step.*
 
 [![CI](https://github.com/createiflabs/NeuroDB/actions/workflows/ci.yml/badge.svg)](https://github.com/createiflabs/NeuroDB/actions/workflows/ci.yml)
 [![Docker Pulls](https://img.shields.io/docker/pulls/createiflabs/neurodb)](https://hub.docker.com/r/createiflabs/neurodb)
@@ -12,24 +14,38 @@
 
 </div>
 
-NeuroDB stores high-dimensional vectors (embeddings) alongside arbitrary JSON
-metadata and serves fast nearest-neighbour similarity search over a clean REST
-API. It's the long-term **memory layer** for AI apps: semantic search,
-retrieval-augmented generation (RAG), recommendations and deduplication.
+NeuroDB stores patterns (vectors) as the rows of a matrix and recalls them by
+content, not by key. It is built on **Modern Hopfield networks**
+([Ramsauer et al., 2020](https://arxiv.org/abs/2008.02217)), whose update rule is
+a single attention step:
 
-- ⚡ **Fast** — vectorised cosine / dot / Euclidean search powered by NumPy.
-- 🧩 **Simple** — one tiny service, a REST API, an OpenAPI spec and a live dashboard.
-- 💾 **Durable** — collections persist to disk and reload on startup.
-- 🏷️ **Filterable** — Mongo-style metadata filters (`$in`, `$gte`, `$lt`, …).
-- 🔐 **Secure-ready** — optional API-key auth on all data routes.
-- 🐳 **Container-native** — a slim, non-root, multi-arch image: `createiflabs/neurodb`.
-- 🪶 **Zero-config demo** — a built-in lexical text embedder so you can try it instantly.
+```
+p  = softmax(β · X · q)     # how strongly a query q attends to each stored pattern
+x* = Xᵀ · p                 # the recalled (reconstructed) pattern
+```
+
+With a high inverse-temperature `β`, recall snaps to the single closest stored
+pattern (exact content-addressable memory and pattern completion); with a low
+`β`, it returns a soft blend. From this one primitive NeuroDB offers:
+
+- 🧲 **Associative recall & pattern completion** — query with a full, partial or
+  noisy vector and get the completed pattern back (`/complete`, with an optional
+  field `mask`).
+- 🚨 **Per-field anomaly detection** — recall the pattern an input *should* match,
+  then report exactly which fields deviate and by how much (`/anomaly`).
+- 🔎 **Similarity search** — classic nearest-neighbour retrieval by cosine
+  similarity (`/search`).
+- ✍️ **Append-only writes** — storing a pattern is just appending a row; no
+  training, no index rebuild.
+- 💾 **Single-file persistence** — the entire store is one `.npz` file that loads
+  on startup and autosaves.
+- 🐳 **Container-native** — a slim, non-root, multi-arch image.
 
 ---
 
 ## Quick start
 
-### 🐳 Docker (recommended)
+### 🐳 Docker
 
 ```bash
 # GitHub Container Registry (published by CI on every push to main):
@@ -39,8 +55,7 @@ docker run -d --name neurodb -p 8000:8000 -v neurodb_data:/data ghcr.io/createif
 docker run -d --name neurodb -p 8000:8000 -v neurodb_data:/data createiflabs/neurodb:latest
 ```
 
-Then open **http://localhost:8000** for the dashboard, or
-**http://localhost:8000/docs** for interactive API docs.
+Open **http://localhost:8000** for the dashboard or **/docs** for the OpenAPI UI.
 
 ### 🧱 Docker Compose
 
@@ -57,43 +72,56 @@ python -m neurodb              # serves on http://0.0.0.0:8000
 
 ---
 
-## The dashboard
+## Walkthrough
 
-Browse to the root URL for a built-in playground: paste documents, embed and
-store them, then run semantic queries and watch them rank by similarity. The
-demo uses NeuroDB's lightweight **lexical** embedder so it works with no model
-downloads — for production semantics, generate embeddings with your model of
-choice and push the raw vectors via the API.
+### Create a memory
 
----
-
-## Using the API
-
-### 1. Create a collection
+A *memory* is one Hopfield associative memory: a fixed dimension, an inverse
+temperature `beta`, and optional per-dimension `fields` (handy for anomaly
+reports on structured records).
 
 ```bash
-curl -X POST localhost:8000/collections \
-  -H 'content-type: application/json' \
-  -d '{"name": "documents", "dimension": 256, "metric": "cosine"}'
+curl -X POST localhost:8000/memories -H 'content-type: application/json' -d '{
+  "name": "sensors", "dimension": 3, "beta": 12,
+  "fields": ["temperature", "humidity", "pressure"]
+}'
 ```
 
-### 2. Upsert vectors with metadata
+### Write patterns (append vectors)
 
 ```bash
-curl -X POST localhost:8000/collections/documents/vectors \
-  -H 'content-type: application/json' \
-  -d '{"items": [
-        {"id": "doc-1", "vector": [0.12, 0.04, ...], "metadata": {"lang": "en"}},
-        {"id": "doc-2", "vector": [0.31, 0.92, ...], "metadata": {"lang": "de"}}
-      ]}'
+curl -X POST localhost:8000/memories/sensors/patterns -H 'content-type: application/json' -d '{
+  "items": [
+    {"vector": [20, 50, 1013]}, {"vector": [21, 52, 1012]},
+    {"vector": [19, 48, 1014]}, {"vector": [20, 51, 1013]}
+  ]
+}'
 ```
 
-### 3. Search (with an optional metadata filter)
+### Pattern completion
+
+Know only the temperature? Mark dimension `0` as known and let NeuroDB complete
+the rest:
 
 ```bash
-curl -X POST localhost:8000/collections/documents/search \
-  -H 'content-type: application/json' \
-  -d '{"vector": [0.10, 0.05, ...], "k": 5, "filter": {"lang": "en"}}'
+curl -X POST localhost:8000/memories/sensors/complete -H 'content-type: application/json' \
+  -d '{"query": [20, 0, 0], "mask": [0]}'
+# → reconstruction ≈ [20.0, 51.9, 1012.9]
+```
+
+### Per-field anomaly detection
+
+```bash
+curl -X POST localhost:8000/memories/sensors/anomaly -H 'content-type: application/json' \
+  -d '{"query": [20, 95, 1013]}'
+# → score 47.0; top field {"name": "humidity", "value": 95, "expected": 48, "deviation": 47}
+```
+
+### Similarity search
+
+```bash
+curl -X POST localhost:8000/memories/sensors/search -H 'content-type: application/json' \
+  -d '{"query": [20, 50, 1013], "k": 3}'
 ```
 
 ### Bring your own embeddings (Python)
@@ -102,66 +130,62 @@ curl -X POST localhost:8000/collections/documents/search \
 import urllib.request, json
 from sentence_transformers import SentenceTransformer
 
-model = SentenceTransformer("all-MiniLM-L6-v2")   # 384-dim
+model = SentenceTransformer("all-MiniLM-L6-v2")
 dim = model.get_sentence_embedding_dimension()
 
 def call(path, body):
-    req = urllib.request.Request(
-        f"http://localhost:8000{path}",
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-    )
+    req = urllib.request.Request(f"http://localhost:8000{path}",
+        data=json.dumps(body).encode(), headers={"content-type": "application/json"})
     return json.load(urllib.request.urlopen(req))
 
-call("/collections", {"name": "kb", "dimension": dim, "metric": "cosine"})
-docs = ["NeuroDB is a vector database.", "Paris is the capital of France."]
-call("/collections/kb/vectors", {"items": [
+call("/memories", {"name": "kb", "dimension": dim, "beta": 16})
+docs = ["NeuroDB recalls patterns by content.", "Paris is the capital of France."]
+call("/memories/kb/patterns", {"items": [
     {"id": str(i), "vector": model.encode(d).tolist(), "metadata": {"text": d}}
-    for i, d in enumerate(docs)
-]})
-hits = call("/collections/kb/search",
-            {"vector": model.encode("which db stores embeddings?").tolist(), "k": 2})
-print(hits["results"][0]["metadata"]["text"])
+    for i, d in enumerate(docs)]})
+hit = call("/memories/kb/complete", {"query": model.encode("memory by content").tolist()})
+print(hit["top"]["metadata"]["text"])
 ```
 
 ### Demo text endpoints (built-in embedder)
 
-If a collection's dimension matches the built-in embedder (`256` by default),
-you can skip embedding yourself:
+For zero-setup demos, NeuroDB ships a lightweight lexical embedder. Create a
+memory whose dimension matches it (`256` by default) and push text directly:
 
 ```bash
-curl -X POST localhost:8000/collections/demo/texts \
-  -H 'content-type: application/json' \
+curl -X POST localhost:8000/memories/demo/texts -H 'content-type: application/json' \
   -d '{"items": [{"text": "golden retrievers are friendly dogs"}]}'
 
-curl -X POST localhost:8000/collections/demo/search/text \
-  -H 'content-type: application/json' \
-  -d '{"text": "friendly dog breeds", "k": 3}'
+curl -X POST localhost:8000/memories/demo/recall/text -H 'content-type: application/json' \
+  -d '{"text": "friendly puppy", "k": 3}'   # returns the attention distribution
 ```
+
+> The built-in embedder is *lexical*, not neural — great for demos, but for real
+> semantics generate embeddings with your own model and push raw vectors.
 
 ---
 
 ## API reference
 
-| Method   | Path                                   | Description                          |
-| -------- | -------------------------------------- | ------------------------------------ |
-| `GET`    | `/`                                    | Web dashboard                        |
-| `GET`    | `/health`                              | Liveness + counts (public)           |
-| `GET`    | `/version`                             | Version & embedder info (public)     |
-| `GET`    | `/docs`                                | Interactive OpenAPI docs             |
-| `GET`    | `/stats`                               | Per-collection statistics            |
-| `POST`   | `/collections`                         | Create a collection                  |
-| `GET`    | `/collections`                         | List collections                     |
-| `GET`    | `/collections/{name}`                  | Collection info                      |
-| `DELETE` | `/collections/{name}`                  | Delete a collection                  |
-| `POST`   | `/collections/{name}/persist`          | Force-flush to disk                  |
-| `POST`   | `/collections/{name}/vectors`          | Upsert vectors                       |
-| `GET`    | `/collections/{name}/vectors/{id}`     | Fetch a vector                       |
-| `DELETE` | `/collections/{name}/vectors/{id}`     | Delete a vector                      |
-| `POST`   | `/collections/{name}/search`           | Nearest-neighbour search             |
-| `POST`   | `/collections/{name}/texts`            | Upsert text (built-in embedder)      |
-| `POST`   | `/collections/{name}/search/text`      | Text search (built-in embedder)      |
-| `POST`   | `/embed`                               | Embed text → vector                  |
+| Method   | Path                                  | Description                                |
+| -------- | ------------------------------------- | ------------------------------------------ |
+| `GET`    | `/`                                   | Web dashboard                              |
+| `GET`    | `/health` · `/version`                | Liveness & engine info (public)            |
+| `GET`    | `/docs`                               | Interactive OpenAPI docs                   |
+| `GET`    | `/stats`                              | Per-memory statistics                      |
+| `POST`   | `/memories`                           | Create a memory                            |
+| `GET`    | `/memories` · `/memories/{n}`         | List / inspect memories                    |
+| `DELETE` | `/memories/{n}`                       | Delete a memory                            |
+| `POST`   | `/memories/{n}/patterns`              | Append patterns                            |
+| `GET`    | `/memories/{n}/patterns/{id}`         | Fetch a pattern                            |
+| `DELETE` | `/memories/{n}/patterns/{id}`         | Delete a pattern                           |
+| `POST`   | `/memories/{n}/complete`              | Recall / pattern completion                |
+| `POST`   | `/memories/{n}/search`                | Nearest patterns (cosine)                  |
+| `POST`   | `/memories/{n}/anomaly`               | Per-field anomaly detection                |
+| `POST`   | `/memories/{n}/texts`                 | Append text (built-in embedder)            |
+| `POST`   | `/memories/{n}/search/text`           | Text similarity search                     |
+| `POST`   | `/memories/{n}/recall/text`           | Text recall (attention distribution)       |
+| `POST`   | `/embed`                              | Embed text → vector                        |
 
 ---
 
@@ -169,33 +193,38 @@ curl -X POST localhost:8000/collections/demo/search/text \
 
 All settings are environment variables:
 
-| Variable                    | Default  | Description                                      |
-| --------------------------- | -------- | ------------------------------------------------ |
-| `NEURODB_DATA_DIR`          | `./data` | Where collections are persisted.                 |
-| `NEURODB_HOST`              | `0.0.0.0`| Bind address.                                    |
-| `NEURODB_PORT`              | `8000`   | Bind port.                                        |
-| `NEURODB_AUTOSAVE_INTERVAL` | `5`      | Seconds between autosaves of dirty collections.  |
-| `NEURODB_API_KEY`           | _(unset)_| If set, all data routes require this key.        |
-| `NEURODB_CORS_ORIGINS`      | `*`      | Comma-separated allowed CORS origins.            |
-| `NEURODB_EMBEDDING_DIM`     | `256`    | Dimension of the built-in text embedder.         |
-| `NEURODB_LOG_LEVEL`         | `info`   | Log level.                                        |
+| Variable                    | Default               | Description                                   |
+| --------------------------- | --------------------- | --------------------------------------------- |
+| `NEURODB_DATA_FILE`         | `./data/neurodb.npz`  | Single file the whole store persists to.      |
+| `NEURODB_HOST`              | `0.0.0.0`             | Bind address.                                 |
+| `NEURODB_PORT`              | `8000`                | Bind port.                                    |
+| `NEURODB_AUTOSAVE_INTERVAL` | `5`                   | Seconds between autosaves when dirty.         |
+| `NEURODB_API_KEY`           | _(unset)_             | If set, all data routes require this key.      |
+| `NEURODB_CORS_ORIGINS`      | `*`                   | Comma-separated allowed CORS origins.         |
+| `NEURODB_EMBEDDING_DIM`     | `256`                 | Dimension of the built-in text embedder.      |
+| `NEURODB_LOG_LEVEL`         | `info`                | Log level.                                    |
 
-When `NEURODB_API_KEY` is set, send it as `X-API-Key: <key>` or
-`Authorization: Bearer <key>`.
+When `NEURODB_API_KEY` is set, send `X-API-Key: <key>` or `Authorization: Bearer <key>`.
 
 ---
 
 ## How it works
 
-Each collection keeps its vectors in a contiguous `float32` matrix, so a search
-is a single vectorised NumPy operation (`O(N·D)` brute force) followed by a
-partial top-`k` sort. This is exact, dependency-light and plenty fast into the
-hundreds of thousands of vectors. Collections persist as a `vectors.npy` matrix
-plus a `meta.json` sidecar and reload automatically on startup.
+Patterns are the rows of a `float32` matrix `X`. Every operation is the same
+single Hopfield attention step `p = softmax(β·X·q)`, computed as one vectorised
+NumPy matmul (`O(N·d)`), followed by `x* = Xᵀ·p`:
 
-> **Scope:** NeuroDB favours correctness and simplicity over billion-scale ANN
-> indexes. If you outgrow brute-force search, it's a clean base to add an HNSW
-> index behind the same API.
+- **complete** runs the step; with a `mask`, the known dimensions are clamped and
+  only the unknown ones are filled (iterate with `steps > 1` for sharper recall).
+- **anomaly** recalls `x*` for the input and reports the per-dimension residual
+  `|q − x*|`, naming the worst fields.
+- **search** ranks patterns by cosine similarity.
+
+The whole store — every memory's matrix, ids and metadata — serialises to a
+single `.npz` file, written atomically and reloaded on startup.
+
+> **Scope:** NeuroDB favours exactness and simplicity over billion-scale ANN.
+> It's a clean, correct associative-memory layer that's easy to reason about.
 
 ---
 
@@ -205,22 +234,13 @@ plus a `meta.json` sidecar and reload automatically on startup.
 pip install -r requirements-dev.txt -e .
 ruff check .        # lint
 pytest -q           # tests
-python -m neurodb   # run locally
-
-# or use the Makefile:
-make install && make test && make run
+python -m neurodb   # run locally   (or: make install && make test && make run)
+python examples/quickstart.py   # end-to-end demo against a running server
 ```
 
-Build the image locally:
-
-```bash
-docker build -t createiflabs/neurodb:dev .
-docker run --rm -p 8000:8000 createiflabs/neurodb:dev
-```
-
-CI (GitHub Actions) lints and tests on Python 3.10–3.12, then builds and pushes
-a multi-arch (`linux/amd64`, `linux/arm64`) image to Docker Hub on pushes to
-`main` and version tags.
+CI lints and tests on Python 3.10–3.12, then builds a multi-arch
+(`linux/amd64`, `linux/arm64`) image and publishes it to GHCR (always) and Docker
+Hub (when `DOCKERHUB_TOKEN` is set).
 
 ---
 

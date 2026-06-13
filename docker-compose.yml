@@ -6,7 +6,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      NEURODB_DATA_DIR: /data
+      NEURODB_DATA_FILE: /data/neurodb.npz
       NEURODB_AUTOSAVE_INTERVAL: "5"
       # Uncomment to require an API key on all data routes:
       # NEURODB_API_KEY: "change-me"

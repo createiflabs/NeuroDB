@@ -42,7 +42,9 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 class Settings:
     """All knobs are configured via ``NEURODB_*`` environment variables."""
 
-    data_dir: str = field(default_factory=lambda: _env_str("NEURODB_DATA_DIR", "./data"))
+    data_file: str = field(
+        default_factory=lambda: _env_str("NEURODB_DATA_FILE", "./data/neurodb.npz")
+    )
     host: str = field(default_factory=lambda: _env_str("NEURODB_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: _env_int("NEURODB_PORT", 8000))
     autosave_interval: float = field(

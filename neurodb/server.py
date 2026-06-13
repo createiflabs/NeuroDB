@@ -19,50 +19,50 @@ from . import __version__
 from .config import Settings, get_settings
 from .embedding import embed_text
 from .models import (
-    CreateCollectionRequest,
+    AnomalyRequest,
+    CompleteRequest,
+    CreateMemoryRequest,
     EmbedRequest,
     SearchRequest,
     TextSearchRequest,
-    TextUpsertRequest,
-    UpsertRequest,
+    TextWriteRequest,
+    WriteRequest,
 )
-from .store import CollectionError, NotFoundError, StoreError, VectorStore
+from .store import MemoryError_, NeuroStore, NotFoundError, StoreError
 
 logger = logging.getLogger("neurodb")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 DESCRIPTION = (
-    "NeuroDB is a lightweight, container-native **vector database** for AI memory "
-    "and semantic search. Store embeddings with JSON metadata and run fast "
-    "nearest-neighbour queries over a clean REST API."
+    "NeuroDB is a content-addressable store powered by **Modern Hopfield "
+    "networks**. Writing a pattern is appending a vector; retrieval is a single "
+    "attention step. It offers pattern completion, per-field anomaly detection "
+    "and similarity search, with single-file persistence."
 )
 
 
-async def _autosave_loop(store: VectorStore, interval: float) -> None:
-    """Periodically persist collections that have unsaved changes."""
-
+async def _autosave_loop(store: NeuroStore, interval: float) -> None:
     if interval <= 0:
         return
     while True:
         try:
             await asyncio.sleep(interval)
-            flushed = await run_in_threadpool(store.flush)
-            if flushed:
-                logger.debug("autosave: flushed %d collection(s)", flushed)
+            if await run_in_threadpool(store.flush):
+                logger.debug("autosave: persisted store")
         except asyncio.CancelledError:
             raise
-        except Exception:  # pragma: no cover - defensive, keep the loop alive
+        except Exception:  # pragma: no cover - keep the loop alive
             logger.exception("autosave loop error")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    store = VectorStore(settings.data_dir)
+    store = NeuroStore(settings.data_file)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        logger.info("NeuroDB %s starting (data_dir=%s)", __version__, settings.data_dir)
+        logger.info("NeuroDB %s starting (data_file=%s)", __version__, settings.data_file)
         task = asyncio.create_task(_autosave_loop(store, settings.autosave_interval))
         try:
             yield
@@ -73,7 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except asyncio.CancelledError:
                 pass
             await run_in_threadpool(store.save_all)
-            logger.info("NeuroDB stopped; all collections persisted")
+            logger.info("NeuroDB stopped; store persisted")
 
     app = FastAPI(
         title="NeuroDB",
@@ -94,7 +94,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # -- error handling ---------------------------------------------------
     @app.exception_handler(NotFoundError)
     async def _not_found(_request, exc: NotFoundError):
         return JSONResponse(status_code=404, content={"detail": str(exc)})
@@ -103,7 +102,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _store_error(_request, exc: StoreError):
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    # -- auth -------------------------------------------------------------
     async def require_api_key(
         x_api_key: str | None = Header(None, alias="X-API-Key"),
         authorization: str | None = Header(None),
@@ -130,8 +128,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "status": "ok",
             "version": __version__,
-            "collections": stats["collections"],
-            "vectors": stats["vectors"],
+            "memories": stats["memories"],
+            "patterns": stats["patterns"],
         }
 
     @app.get("/version", tags=["system"])
@@ -139,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "name": "NeuroDB",
             "version": __version__,
+            "engine": "modern-hopfield",
             "embedding_dim": settings.embedding_dim,
             "auth_required": bool(settings.api_key),
         }
@@ -150,70 +149,78 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def stats():
         return store.stats()
 
-    @api.post("/collections", tags=["collections"], status_code=201)
-    async def create_collection(body: CreateCollectionRequest):
-        col = store.create_collection(body.name, body.dimension, body.metric)
-        return col.info()
+    @api.post("/memories", tags=["memories"], status_code=201)
+    async def create_memory(body: CreateMemoryRequest):
+        mem = store.create_memory(body.name, body.dimension, body.beta, body.fields)
+        return mem.info()
 
-    @api.get("/collections", tags=["collections"])
-    async def list_collections():
-        return {"collections": store.list_collections()}
+    @api.get("/memories", tags=["memories"])
+    async def list_memories():
+        return {"memories": store.list_memories()}
 
-    @api.get("/collections/{name}", tags=["collections"])
-    async def get_collection(name: str):
-        return store.get_collection(name).info()
+    @api.get("/memories/{name}", tags=["memories"])
+    async def get_memory(name: str):
+        return store.get_memory(name).info()
 
-    @api.delete("/collections/{name}", tags=["collections"])
-    async def delete_collection(name: str):
-        store.delete_collection(name)
+    @api.delete("/memories/{name}", tags=["memories"])
+    async def delete_memory(name: str):
+        store.delete_memory(name)
         return {"deleted": name}
 
-    @api.post("/collections/{name}/persist", tags=["collections"])
-    async def persist_collection(name: str):
-        col = store.get_collection(name)
-        await run_in_threadpool(col.save, store._dir(name))
-        return {"persisted": name, "count": col.count}
-
-    @api.post("/collections/{name}/vectors", tags=["vectors"])
-    async def upsert_vectors(name: str, body: UpsertRequest):
-        col = store.get_collection(name)
+    # -- patterns (writing is appending a vector) ------------------------
+    @api.post("/memories/{name}/patterns", tags=["patterns"])
+    async def write_patterns(name: str, body: WriteRequest):
+        mem = store.get_memory(name)
         items = [item.model_dump() for item in body.items]
-        affected = await run_in_threadpool(col.upsert, items)
-        return {"upserted": len(affected), "ids": affected}
+        affected = await run_in_threadpool(mem.write, items)
+        return {"written": len(affected), "ids": affected}
 
-    @api.get("/collections/{name}/vectors/{vector_id}", tags=["vectors"])
-    async def get_vector(name: str, vector_id: str):
-        return store.get_collection(name).get(vector_id)
+    @api.get("/memories/{name}/patterns/{pattern_id}", tags=["patterns"])
+    async def get_pattern(name: str, pattern_id: str):
+        return store.get_memory(name).get(pattern_id)
 
-    @api.delete("/collections/{name}/vectors/{vector_id}", tags=["vectors"])
-    async def delete_vector(name: str, vector_id: str):
-        col = store.get_collection(name)
-        removed = await run_in_threadpool(col.delete, [vector_id])
+    @api.delete("/memories/{name}/patterns/{pattern_id}", tags=["patterns"])
+    async def delete_pattern(name: str, pattern_id: str):
+        mem = store.get_memory(name)
+        removed = await run_in_threadpool(mem.delete, [pattern_id])
         if removed == 0:
-            raise NotFoundError(f"Vector {vector_id!r} not found in collection {name!r}.")
-        return {"deleted": vector_id}
+            raise NotFoundError(f"Pattern {pattern_id!r} not found in memory {name!r}.")
+        return {"deleted": pattern_id}
 
-    @api.post("/collections/{name}/search", tags=["search"])
+    # -- content-addressable operations ----------------------------------
+    @api.post("/memories/{name}/complete", tags=["recall"])
+    async def complete(name: str, body: CompleteRequest):
+        mem = store.get_memory(name)
+        return await run_in_threadpool(
+            mem.complete, body.query, body.beta, body.mask, body.steps, body.top_k
+        )
+
+    @api.post("/memories/{name}/search", tags=["recall"])
     async def search(name: str, body: SearchRequest):
-        col = store.get_collection(name)
+        mem = store.get_memory(name)
         results = await run_in_threadpool(
-            col.search, body.vector, body.k, body.filter, body.include_vectors
+            mem.search, body.query, body.k, body.filter, body.include_vectors
         )
         return {"results": results, "count": len(results)}
 
-    # -- text convenience endpoints (use the built-in embedder) -----------
-    def _ensure_text_dim(col) -> None:
-        if col.dimension != settings.embedding_dim:
-            raise CollectionError(
-                f"Collection {col.name!r} has dimension {col.dimension}, but the "
-                f"built-in text embedder produces {settings.embedding_dim}-d vectors. "
-                "Create the collection with that dimension to use /texts endpoints."
+    @api.post("/memories/{name}/anomaly", tags=["recall"])
+    async def anomaly(name: str, body: AnomalyRequest):
+        mem = store.get_memory(name)
+        return await run_in_threadpool(mem.anomaly, body.query, body.beta, body.top_k)
+
+    # -- text convenience endpoints (built-in embedder) ------------------
+    def _ensure_text_dim(mem) -> None:
+        if mem.dimension != settings.embedding_dim:
+            raise MemoryError_(
+                f"Memory {mem.name!r} has dimension {mem.dimension}, but the built-in "
+                f"text embedder produces {settings.embedding_dim}-d vectors. Create the "
+                "memory with that dimension to use /texts endpoints."
             )
 
-    @api.post("/collections/{name}/texts", tags=["text"])
-    async def upsert_texts(name: str, body: TextUpsertRequest):
-        col = store.get_collection(name)
-        _ensure_text_dim(col)
+    @api.post("/memories/{name}/texts", tags=["text"])
+    async def write_texts(name: str, body: TextWriteRequest):
+        mem = store.get_memory(name)
+        _ensure_text_dim(mem)
         items = []
         for item in body.items:
             meta = dict(item.metadata)
@@ -225,18 +232,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "metadata": meta,
                 }
             )
-        affected = await run_in_threadpool(col.upsert, items)
-        return {"upserted": len(affected), "ids": affected}
+        affected = await run_in_threadpool(mem.write, items)
+        return {"written": len(affected), "ids": affected}
 
-    @api.post("/collections/{name}/search/text", tags=["text"])
+    @api.post("/memories/{name}/search/text", tags=["text"])
     async def search_text(name: str, body: TextSearchRequest):
-        col = store.get_collection(name)
-        _ensure_text_dim(col)
+        mem = store.get_memory(name)
+        _ensure_text_dim(mem)
         vector = embed_text(body.text, settings.embedding_dim).tolist()
         results = await run_in_threadpool(
-            col.search, vector, body.k, body.filter, body.include_vectors
+            mem.search, vector, body.k, body.filter, body.include_vectors
         )
         return {"results": results, "count": len(results)}
+
+    @api.post("/memories/{name}/recall/text", tags=["text"])
+    async def recall_text(name: str, body: TextSearchRequest):
+        """Hopfield recall over text memories: returns the attention distribution
+        across stored patterns for the embedded query."""
+
+        mem = store.get_memory(name)
+        _ensure_text_dim(mem)
+        vector = embed_text(body.text, settings.embedding_dim).tolist()
+        return await run_in_threadpool(mem.complete, vector, None, None, 1, body.k)
 
     @api.post("/embed", tags=["text"])
     async def embed(body: EmbedRequest):

@@ -689,7 +689,7 @@ class NeuroStore:
                 arrays[f"X@{snap.name}"] = snap.matrix
             tmp = self._tmp_path()
             with open(tmp, "wb") as handle:
-                np.savez(handle, **arrays)
+                np.savez(handle, **arrays)  # type: ignore[arg-type]
                 # Force the bytes to disk before the atomic rename so a crash
                 # can never leave a half-written file as the live data file.
                 handle.flush()

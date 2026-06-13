@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 
 def _env_str(name: str, default: str) -> str:
     value = os.environ.get(name)
-    return value if value not in (None, "") else default
+    return value if value else default
 
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
-    if raw in (None, ""):
+    if not raw:
         return default
     try:
         return int(raw)
@@ -23,7 +23,7 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
-    if raw in (None, ""):
+    if not raw:
         return default
     try:
         return float(raw)
@@ -33,14 +33,14 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_list(name: str, default: list[str]) -> list[str]:
     raw = os.environ.get(name)
-    if raw in (None, ""):
+    if not raw:
         return list(default)
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
-    if raw in (None, ""):
+    if not raw:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
@@ -52,7 +52,11 @@ class Settings:
     data_file: str = field(
         default_factory=lambda: _env_str("NEURODB_DATA_FILE", "./data/neurodb.npz")
     )
-    host: str = field(default_factory=lambda: _env_str("NEURODB_HOST", "0.0.0.0"))
+    # Bind all interfaces by default so the container is reachable; restrict
+    # exposure at the orchestrator/firewall, or override NEURODB_HOST.
+    host: str = field(
+        default_factory=lambda: _env_str("NEURODB_HOST", "0.0.0.0")  # noqa: S104  # nosec B104
+    )
     port: int = field(default_factory=lambda: _env_int("NEURODB_PORT", 8000))
     autosave_interval: float = field(
         default_factory=lambda: _env_float("NEURODB_AUTOSAVE_INTERVAL", 5.0)

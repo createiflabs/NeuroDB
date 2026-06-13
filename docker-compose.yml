@@ -5,14 +5,39 @@ services:
     container_name: neurodb
     ports:
       - "8000:8000"
+    # Load secrets/config from .env (see .env.example).
+    env_file:
+      - path: .env
+        required: false
     environment:
       NEURODB_DATA_FILE: /data/neurodb.npz
       NEURODB_AUTOSAVE_INTERVAL: "5"
-      # Uncomment to require an API key on all data routes:
+      # Local-dev convenience: run without auth. FOR PRODUCTION, delete the line
+      # below and set NEURODB_API_KEY (e.g. in .env) instead.
+      NEURODB_ALLOW_ANONYMOUS: "1"
       # NEURODB_API_KEY: "change-me"
+      # NEURODB_CORS_ORIGINS: "https://your-frontend.example"
     volumes:
       - neurodb_data:/data
     restart: unless-stopped
+    # Hardening: drop privileges and make the root filesystem read-only
+    # (only the data volume and a small tmpfs are writable).
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Resource limits — size to your data: resident memory is roughly
+    # (total patterns) x dimension x 4 bytes, with a transient bump during save.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+        reservations:
+          memory: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 30s

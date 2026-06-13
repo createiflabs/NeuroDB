@@ -189,18 +189,37 @@ curl -X POST localhost:8000/memories/demo/recall/text -H 'content-type: applicat
 
 All settings are environment variables:
 
-| Variable                    | Default               | Description                                   |
-| --------------------------- | --------------------- | --------------------------------------------- |
-| `NEURODB_DATA_FILE`         | `./data/neurodb.npz`  | Single file the whole store persists to.      |
-| `NEURODB_HOST`              | `0.0.0.0`             | Bind address.                                 |
-| `NEURODB_PORT`              | `8000`                | Bind port.                                    |
-| `NEURODB_AUTOSAVE_INTERVAL` | `5`                   | Seconds between autosaves when dirty.         |
-| `NEURODB_API_KEY`           | _(unset)_             | If set, all data routes require this key.      |
-| `NEURODB_CORS_ORIGINS`      | `*`                   | Comma-separated allowed CORS origins.         |
-| `NEURODB_EMBEDDING_DIM`     | `256`                 | Dimension of the built-in text embedder.      |
-| `NEURODB_LOG_LEVEL`         | `info`                | Log level.                                    |
+| Variable                     | Default               | Description                                                        |
+| ---------------------------- | --------------------- | ------------------------------------------------------------------ |
+| `NEURODB_DATA_FILE`          | `./data/neurodb.npz`  | Single file the whole store persists to.                           |
+| `NEURODB_HOST`               | `0.0.0.0`             | Bind address.                                                      |
+| `NEURODB_PORT`               | `8000`                | Bind port.                                                         |
+| `NEURODB_AUTOSAVE_INTERVAL`  | `5`                   | Seconds between autosaves when dirty.                              |
+| `NEURODB_API_KEY`            | _(unset)_             | Required on data routes when set (see auth below).                 |
+| `NEURODB_ALLOW_ANONYMOUS`    | `false`               | Allow running without a key. **Required** if `NEURODB_API_KEY` is unset, otherwise the server refuses to start. |
+| `NEURODB_CORS_ORIGINS`       | _(empty)_             | Comma-separated allowed CORS origins. Empty = no cross-origin.     |
+| `NEURODB_RATE_LIMIT_PER_MINUTE` | `600`              | Per-client (API key, else IP) request budget; `0` disables.        |
+| `NEURODB_MAX_REQUEST_BYTES`  | `8388608`             | Reject larger request bodies with `413`.                           |
+| `NEURODB_FAIL_ON_CORRUPT_LOAD` | `false`             | Fail startup on an unreadable data file instead of quarantining.   |
+| `NEURODB_EMBEDDING_DIM`      | `256`                 | Dimension of the built-in text embedder.                           |
+| `NEURODB_LOG_LEVEL`          | `info`                | Log level.                                                         |
+| `NEURODB_LOG_FORMAT`         | `json`                | `json` (structured, with request ids) or `text`.                  |
 
-When `NEURODB_API_KEY` is set, send `X-API-Key: <key>` or `Authorization: Bearer <key>`.
+### Security & operations
+
+NeuroDB is **secure by default**: with no `NEURODB_API_KEY` it refuses to start
+unless `NEURODB_ALLOW_ANONYMOUS=1` is set explicitly. When a key is set, send
+`X-API-Key: <key>` or `Authorization: Bearer <key>`. CORS is closed unless you
+list origins, request bodies are size-capped, and a per-client rate limit is
+applied. `/health`, `/version`, `/ready`, `/metrics` and `/` stay public.
+
+- **API**: served under `/v1` (the unversioned paths still work but send a
+  `Deprecation` header).
+- **Liveness/readiness**: `/health` (cheap liveness) and `/ready` (503 until the
+  last persist succeeded).
+- **Metrics**: Prometheus exposition at `/metrics`.
+- **Durability**: see [docs/OPERATIONS.md](docs/OPERATIONS.md); deployment guide
+  in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
@@ -217,7 +236,15 @@ NumPy matmul (`O(N·d)`), followed by `x* = Xᵀ·p`:
 - **search** ranks patterns by cosine similarity.
 
 The whole store — every memory's matrix, ids and metadata — serialises to a
-single `.npz` file, written atomically and reloaded on startup.
+single `.npz` file. Each save snapshots every memory under its lock, writes a
+temp file, `fsync`s it, and atomically renames it into place, so a crash never
+leaves a torn file and the persisted matrix always matches its ids. Writes are
+buffered in memory and persisted by (a) the periodic autosave when dirty,
+(b) an explicit `POST /v1/flush` (synchronous + durable), and (c) graceful
+shutdown. A `kill -9` can therefore lose up to `NEURODB_AUTOSAVE_INTERVAL`
+seconds of un-flushed writes — call `/v1/flush` when you need a hard durability
+point. A corrupt data file on startup is quarantined (never deleted) and the
+store starts empty, unless `NEURODB_FAIL_ON_CORRUPT_LOAD=1`.
 
 > **Scope:** NeuroDB favours exactness and simplicity over billion-scale ANN.
 > It's a clean, correct associative-memory layer that's easy to reason about.

@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # ---- builder: install dependencies and the package into an isolated venv ----
+# For reproducible builds, pin the base by digest (managed by Dependabot):
+#   FROM python:3.12-slim@sha256:<digest> AS builder
 FROM python:3.12-slim AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \

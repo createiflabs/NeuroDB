@@ -3,7 +3,7 @@
 # ---- builder: install dependencies and the package into an isolated venv ----
 # For reproducible builds, pin the base by digest (managed by Dependabot):
 #   FROM python:3.12-slim@sha256:<digest> AS builder
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -22,7 +22,7 @@ COPY neurodb ./neurodb
 RUN pip install --no-deps .
 
 # ---- runtime: slim image with only the venv and a non-root user ----
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 LABEL org.opencontainers.image.title="NeuroDB" \
       org.opencontainers.image.description="Content-addressable store powered by Modern Hopfield networks: pattern completion, per-field anomaly detection, similarity search, single-file persistence." \

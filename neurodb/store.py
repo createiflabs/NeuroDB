@@ -28,13 +28,49 @@ from typing import Any
 
 import numpy as np
 
-from .hopfield import retrieve
+from .hopfield import retrieve, softmax
 from .metrics import compute_scores
+from .migrations import migrate
 
 logger = logging.getLogger("neurodb.store")
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_MANIFEST_VERSION = 1
+# Bump on any manifest format change AND register a migration in migrations.py
+# (every version transition must have an explicit, tested function).
+_MANIFEST_VERSION = 2
+
+# Per-memory normalization modes applied before the Hopfield attention step.
+NORMALIZE_MODES = ("none", "zscore", "l2")
+# Floor for per-dimension std / row norm so a degenerate (constant / zero)
+# dimension or pattern never produces a division by zero (NaN/inf).
+_NORM_EPS = 1e-6
+
+# Capacity diagnostics: cap the pairwise/self-recall cost on large memories by
+# sampling, and the self-recall margin / status thresholds.
+_CAPACITY_SAMPLE = 256
+_SELF_RECALL_THRESHOLD = 0.9  # top weight must land on self and exceed this
+_CAPACITY_BETAS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)  # coarse suggested-β search
+# self-recall failure fraction → status
+_CROWDED_FRACTION = 0.1
+_SATURATED_FRACTION = 0.5
+
+
+def resolve_normalize(normalize: str | None, fields: list[str] | None) -> str:
+    """Resolve the effective normalization mode.
+
+    ``None`` selects the structured-record-friendly default: ``"zscore"`` when
+    per-dimension ``fields`` are given (a strong signal the rows are real-world
+    records on disparate scales), otherwise ``"none"`` (raw dot product, the
+    pre-patch behaviour — e.g. for already unit-norm embeddings).
+    """
+
+    if normalize is None:
+        return "zscore" if fields else "none"
+    if normalize not in NORMALIZE_MODES:
+        raise MemoryError_(
+            f"normalize must be one of {NORMALIZE_MODES}, got {normalize!r}."
+        )
+    return normalize
 
 
 class StoreError(Exception):
@@ -47,6 +83,10 @@ class MemoryError_(StoreError):
 
 class NotFoundError(StoreError):
     """A requested memory or pattern does not exist (maps to HTTP 404)."""
+
+
+class LimitExceededError(StoreError):
+    """A write would breach a configured resource ceiling (maps to HTTP 413)."""
 
 
 # Public, clearly-named alias (``MemoryError`` is a Python builtin).
@@ -143,20 +183,32 @@ class MemorySnapshot:
     dimension: int
     beta: float
     fields: list[str] | None
+    normalize: str
     ids: list[str]
     metadata: list[dict[str, Any]]
     matrix: np.ndarray
     version: int
+    collection: dict[str, Any] | None = None
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        manifest = {
             "name": self.name,
             "dimension": self.dimension,
             "beta": self.beta,
             "fields": self.fields,
+            # Additive, optional key: legacy files omit it and load as "none".
+            # mean/std/Z are NOT persisted — they are recomputed from the matrix
+            # on load, so the file can never carry stale statistics.
+            "normalize": self.normalize,
             "ids": self.ids,
             "metadata": self.metadata,
         }
+        # Additive, optional: provenance/attestation/signature of a memory loaded
+        # from a collection bundle, so it survives save/reload (legacy files omit
+        # it and load as a plain memory).
+        if self.collection is not None:
+            manifest["collection"] = self.collection
+        return manifest
 
 
 class Memory:
@@ -168,6 +220,7 @@ class Memory:
         dimension: int,
         beta: float = 8.0,
         fields: list[str] | None = None,
+        normalize: str | None = None,
     ) -> None:
         validate_name(name)
         if int(dimension) <= 0:
@@ -182,18 +235,34 @@ class Memory:
         self.dimension = int(dimension)
         self.beta = float(beta)
         self.fields: list[str] | None = list(fields) if fields else None
+        # How patterns are scaled before the Hopfield step (see module-level
+        # NORMALIZE_MODES). Defaults to "zscore" for structured records (fields
+        # given), "none" otherwise; legacy loads resolve to "none".
+        self.normalize = resolve_normalize(normalize, self.fields)
         self.ids: list[str] = []
         self.metadata: list[dict[str, Any]] = []
         self._index: dict[str, int] = {}
         self._X = np.zeros((0, self.dimension), dtype=np.float32)
         # Cached per-row L2 norms for cosine search; invalidated on mutation.
         self._norms: np.ndarray | None = None
+        # Normalization caches, recomputed from self._X on demand and
+        # invalidated alongside self._norms on every mutation. _Z is the
+        # normalized matrix the Hopfield step runs on; _mean/_std are the
+        # per-dimension zscore statistics used to (de)normalize queries.
+        self._Z: np.ndarray | None = None
+        self._mean: np.ndarray | None = None
+        self._std: np.ndarray | None = None
+        # Cached capacity/saturation diagnostic (lazy; invalidated on mutation).
+        self._capacity: dict[str, Any] | None = None
         self._lock = threading.RLock()
         # Monotonic write version vs. the version last persisted. A memory is
         # dirty when they differ. This (rather than a bare bool) means a write
         # landing during a save is never silently marked clean — see save().
         self._version = 0
         self._saved_version = 0
+        # Collection metadata when this memory was materialized from a bundle
+        # (schema/criteria/provenance/attestation/signature summary); else None.
+        self.collection: dict[str, Any] | None = None
 
     # -- introspection ----------------------------------------------------
     @property
@@ -204,14 +273,117 @@ class Memory:
     def dirty(self) -> bool:
         return self._version != self._saved_version
 
+    @property
+    def approx_bytes(self) -> int:
+        """Estimated in-process footprint of this memory's matrices.
+
+        The raw matrix is ``N x D x 4`` bytes; ``zscore``/``l2`` modes keep a
+        cached normalized matrix ``_Z`` of the same size, so they cost roughly
+        double. ``_Z`` is counted whether or not it is currently materialized,
+        because it will be on the first recall — budget honesty over precision.
+        """
+
+        raw = self._X.nbytes
+        return int(raw * 2 if self.normalize != "none" else raw)
+
     def info(self) -> dict[str, Any]:
-        return {
+        detail = {
             "name": self.name,
             "dimension": self.dimension,
             "beta": self.beta,
             "fields": self.fields,
             "count": self.count,
+            "normalize": self.normalize,
         }
+        if self.collection is not None:
+            detail["collection"] = self.collection
+        return detail
+
+    def stats(self) -> dict[str, Any]:
+        """:meth:`info` plus, for ``zscore`` memories, the per-dimension
+        ``mean``/``std`` used to normalize — useful for debugging why a given
+        field was (or wasn't) flagged as anomalous."""
+
+        with self._lock:
+            detail = self.info()
+            if self.normalize == "zscore":
+                self._ensure_stats()
+                detail["mean"] = self._mean.tolist() if self._mean is not None else None
+                detail["std"] = self._std.tolist() if self._std is not None else None
+            detail["capacity"] = self.capacity_compact()
+            detail["approx_bytes"] = self.approx_bytes
+            return detail
+
+    # -- normalization ----------------------------------------------------
+    def _ensure_stats(self) -> None:
+        """Compute and cache the normalized matrix ``_Z`` (and, for zscore, the
+        ``_mean``/``_std`` statistics) from the current matrix. Must be called
+        under ``self._lock``. A no-op for ``"none"`` mode (the Hopfield step runs
+        on the raw matrix, exactly as before this patch)."""
+
+        if self.normalize == "none" or self._Z is not None:
+            return
+        X = self._X
+        if self.normalize == "zscore":
+            if X.shape[0] < 2:
+                # std is undefined with <2 patterns → identity transform, so
+                # the memory behaves like "none" until there is data to estimate
+                # the statistics from.
+                self._mean = np.zeros(self.dimension, dtype=np.float32)
+                self._std = np.ones(self.dimension, dtype=np.float32)
+            else:
+                self._mean = X.mean(axis=0).astype(np.float32)
+                # Floor the std so a constant dimension (zero variance) maps to 0
+                # in normalized space rather than producing NaN/inf: it then
+                # contributes nothing to similarity, which is correct.
+                self._std = np.maximum(X.std(axis=0), _NORM_EPS).astype(np.float32)
+            self._Z = ((X - self._mean) / self._std).astype(np.float32)
+        else:  # "l2": project every row onto the unit sphere
+            norms = np.maximum(np.linalg.norm(X, axis=1, keepdims=True), _NORM_EPS)
+            self._Z = (X / norms).astype(np.float32)
+
+    def _matrix_Z(self) -> np.ndarray:
+        """The (cached) matrix the Hopfield step runs on for the active mode.
+        Must be called under ``self._lock``. For ``"none"`` this is ``self._X``
+        unchanged, so that path is bit-for-bit identical."""
+
+        if self.normalize == "none":
+            return self._X
+        self._ensure_stats()
+        return self._Z
+
+    def _normalize_query(self, q: np.ndarray) -> np.ndarray:
+        """Normalize a 1-D query ``(D,)`` or a 2-D batch ``(M, D)`` into the
+        active space. Must be called under ``self._lock``."""
+
+        if self.normalize == "none":
+            return q
+        self._ensure_stats()
+        if self.normalize == "zscore":
+            # Broadcasts over both the 1-D and the (M, D) batch case.
+            return ((q - self._mean) / self._std).astype(np.float32)
+        # "l2": project each row (or the single vector) onto the unit sphere;
+        # a zero vector stays zero.
+        if q.ndim == 1:
+            qn = float(np.linalg.norm(q))
+            return (q / qn).astype(np.float32) if qn > _NORM_EPS else q.astype(np.float32)
+        norms = np.maximum(np.linalg.norm(q, axis=1, keepdims=True), _NORM_EPS)
+        return (q / norms).astype(np.float32)
+
+    def _normalized(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Convenience: ``(matrix_Z, normalized_query)`` for the active mode."""
+
+        return self._matrix_Z(), self._normalize_query(q)
+
+    def _denormalize(self, recon_z: np.ndarray) -> np.ndarray:
+        """Map a reconstruction from normalized space back to raw units. For
+        ``zscore`` this inverts the standardization; for ``none`` and ``l2`` the
+        reconstruction is already returned as-is (an l2 recon is directional and
+        lives on the unit sphere, *not* in the original magnitude units)."""
+
+        if self.normalize == "zscore":
+            return (recon_z * self._std + self._mean).astype(np.float32)
+        return recon_z
 
     # -- validation helpers ----------------------------------------------
     def _coerce_vector(self, vector: Iterable[float]) -> np.ndarray:
@@ -223,6 +395,24 @@ class Memory:
             )
         if not np.all(np.isfinite(arr)):
             raise MemoryError_("Vector contains NaN or infinite values.")
+        return arr
+
+    def _coerce_batch(self, queries: Iterable[Iterable[float]]) -> np.ndarray:
+        """Validate a batch of query vectors into an ``(M, D)`` float32 array."""
+
+        try:
+            arr = np.asarray(queries, dtype=np.float32)
+        except (ValueError, TypeError) as exc:
+            raise MemoryError_(f"Invalid batch (ragged or non-numeric): {exc}") from exc
+        if arr.size == 0:  # empty batch (e.g. [] or shape (0, D))
+            return np.zeros((0, self.dimension), dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != self.dimension:
+            raise MemoryError_(
+                f"Batch must be a 2-D array of {self.dimension}-d vectors; "
+                f"got shape {arr.shape}."
+            )
+        if not np.all(np.isfinite(arr)):
+            raise MemoryError_("Batch contains NaN or infinite values.")
         return arr
 
     def _mask_from_indices(self, indices: Iterable[int] | None) -> np.ndarray | None:
@@ -240,6 +430,17 @@ class Memory:
                 raise MemoryError_(f"duplicate mask index {raw}.")
             mask[i] = True
         return mask
+
+    def _invalidate_caches(self) -> None:
+        """Drop every matrix-derived cache after a mutation. Must be called
+        under ``self._lock``; the same invalidation point for all of them keeps
+        the norms and the normalization statistics consistent with ``self._X``."""
+
+        self._norms = None
+        self._Z = None
+        self._mean = None
+        self._std = None
+        self._capacity = None
 
     # -- writing (append a pattern) --------------------------------------
     def write(self, items: Iterable[dict[str, Any]]) -> list[str]:
@@ -284,7 +485,7 @@ class Memory:
                 self.ids.extend(new_ids)
                 self.metadata.extend(new_meta)
 
-            self._norms = None  # invalidate cached norms
+            self._invalidate_caches()
             self._version += 1
             return list(affected)
 
@@ -313,9 +514,80 @@ class Memory:
             self.ids = [i for j, i in enumerate(self.ids) if mask[j]]
             self.metadata = [m for j, m in enumerate(self.metadata) if mask[j]]
             self._index = {i: j for j, i in enumerate(self.ids)}
-            self._norms = None  # invalidate cached norms
+            self._invalidate_caches()
             self._version += 1
             return len(targets)
+
+    # -- updating an existing pattern ------------------------------------
+    def _resolve_field(self, field: int | str) -> int:
+        """Map a field index or (when ``fields`` are named) a field name to an
+        in-range dimension index."""
+
+        if isinstance(field, str):
+            if not self.fields or field not in self.fields:
+                raise MemoryError_(f"unknown field name {field!r}.")
+            i = self.fields.index(field)
+        else:
+            i = int(field)
+        if not (0 <= i < self.dimension):
+            raise MemoryError_(f"field index {i} out of range [0, {self.dimension}).")
+        return i
+
+    def update(
+        self,
+        _id: str,
+        vector: Iterable[float] | None = None,
+        metadata: dict[str, Any] | None = None,
+        merge_metadata: bool = True,
+    ) -> dict[str, Any]:
+        """Update a stored pattern in place. ``vector`` replaces the row;
+        ``metadata`` shallow-merges (or replaces when ``merge_metadata`` is
+        False). Returns the updated pattern (same shape as :meth:`get`)."""
+
+        with self._lock:
+            if _id not in self._index:
+                raise NotFoundError(f"Pattern {_id!r} not found in memory {self.name!r}.")
+            idx = self._index[_id]
+            changed = False
+            if vector is not None:
+                self._X[idx] = self._coerce_vector(vector)
+                self._invalidate_caches()  # norms/stats/Z depend on the matrix
+                changed = True
+            if metadata is not None:
+                if merge_metadata:
+                    merged = dict(self.metadata[idx])
+                    merged.update(metadata)
+                    self.metadata[idx] = merged
+                else:
+                    self.metadata[idx] = dict(metadata)
+                changed = True
+            if changed:
+                self._version += 1
+            return {
+                "id": _id,
+                "vector": self._X[idx].tolist(),
+                "metadata": copy.deepcopy(self.metadata[idx]),
+            }
+
+    def update_field(self, _id: str, field: int | str, value: float) -> dict[str, Any]:
+        """Edit a single field of a structured record (by index or field name)."""
+
+        with self._lock:
+            if _id not in self._index:
+                raise NotFoundError(f"Pattern {_id!r} not found in memory {self.name!r}.")
+            fi = self._resolve_field(field)
+            v = float(value)
+            if not np.isfinite(v):
+                raise MemoryError_("field value must be finite.")
+            idx = self._index[_id]
+            self._X[idx, fi] = v
+            self._invalidate_caches()
+            self._version += 1
+            return {
+                "id": _id,
+                "vector": self._X[idx].tolist(),
+                "metadata": copy.deepcopy(self.metadata[idx]),
+            }
 
     # -- content-addressable operations ----------------------------------
     @staticmethod
@@ -329,18 +601,74 @@ class Memory:
         top = np.argpartition(-scores, k - 1)[:k]
         return top[np.argsort(-scores[top], kind="stable")]
 
-    def _contributors(self, weights: np.ndarray, top_k: int) -> list[dict[str, Any]]:
+    def _contributors(
+        self,
+        weights: np.ndarray,
+        top_k: int,
+        ids: list[str] | None = None,
+        metadata: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        # ``ids``/``metadata`` default to the whole memory, but a filtered call
+        # passes the candidate-aligned slices so weights map to the right rows.
         if weights.shape[0] == 0:
             return []
+        ids = self.ids if ids is None else ids
+        metadata = self.metadata if metadata is None else metadata
         top = self._top_k_indices(weights, top_k)
         return [
             {
-                "id": self.ids[int(i)],
+                "id": ids[int(i)],
                 "weight": float(weights[int(i)]),
-                "metadata": copy.deepcopy(self.metadata[int(i)]),
+                "metadata": copy.deepcopy(metadata[int(i)]),
             }
             for i in top
         ]
+
+    # -- shared result builders / candidate selection --------------------
+    def _empty_complete(self, b: float, steps: int) -> dict[str, Any]:
+        # Empty memory (or a filter matching nothing) has nothing to recall —
+        # mirror search()'s empty result rather than erroring (200 contract).
+        return {
+            "reconstruction": None,
+            "weights": [],
+            "top": None,
+            "beta": b,
+            "steps": max(1, steps),
+        }
+
+    def _empty_anomaly(self, b: float) -> dict[str, Any]:
+        return {
+            "score": 0.0,
+            "z_score": 0.0,
+            "reconstruction": None,
+            "residual": [],
+            "fields": [],
+            "nearest": None,
+            "beta": b,
+        }
+
+    def _candidates(
+        self, flt: dict[str, Any] | None
+    ) -> tuple[np.ndarray, list[str], list[dict[str, Any]]] | None:
+        """Normalized candidate matrix + aligned ids/metadata for the metadata
+        filter (same semantics as :meth:`search`). Returns ``None`` when the
+        filter excludes every pattern. Must be called under ``self._lock``.
+
+        zscore/l2 statistics are always computed over the **full** memory (stable
+        and already cached); only the candidate *rows* are filtered out — so a
+        record is scored against same-type patterns but normalized by the global
+        distribution.
+        """
+
+        Z = self._matrix_Z()
+        if not flt:
+            return Z, self.ids, self.metadata
+        validate_filter(flt)
+        keep = [i for i in range(self._X.shape[0]) if _match_filter(self.metadata[i], flt)]
+        if not keep:
+            return None
+        idx = np.asarray(keep, dtype=np.int64)
+        return Z[idx], [self.ids[i] for i in keep], [self.metadata[i] for i in keep]
 
     def complete(
         self,
@@ -349,26 +677,30 @@ class Memory:
         mask: Iterable[int] | None = None,
         steps: int = 1,
         top_k: int = 5,
+        flt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Content-addressable recall / pattern completion via one (or more)
-        Hopfield attention steps."""
+        Hopfield attention steps. ``flt`` restricts recall to patterns whose
+        metadata matches (same filter syntax as :meth:`search`)."""
 
         with self._lock:
             b = float(beta) if beta is not None else self.beta
             if self._X.shape[0] == 0:
-                # Empty memory has nothing to recall — mirror search()'s empty
-                # result rather than erroring (consistent 200 contract).
-                return {
-                    "reconstruction": None,
-                    "weights": [],
-                    "top": None,
-                    "beta": b,
-                    "steps": max(1, steps),
-                }
+                return self._empty_complete(b, steps)
             q = self._coerce_vector(query)
             mask_arr = self._mask_from_indices(mask)
-            recon, weights = retrieve(self._X, q, b, mask_arr, steps)
-            contributors = self._contributors(weights, top_k)
+            cand = self._candidates(flt)
+            if cand is None:
+                return self._empty_complete(b, steps)
+            Z, ids, meta = cand
+            # Run the Hopfield step in normalized space, then map the result
+            # back to raw units. The mask clamp inside retrieve() therefore
+            # clamps in normalized space (qz[mask]); de-normalizing afterwards
+            # restores the known fields to their exact raw values.
+            qz = self._normalize_query(q)
+            recon_z, weights = retrieve(Z, qz, b, mask_arr, steps)
+            recon = self._denormalize(recon_z)
+            contributors = self._contributors(weights, top_k, ids, meta)
             return {
                 "reconstruction": recon.tolist(),
                 "weights": contributors,
@@ -376,6 +708,47 @@ class Memory:
                 "beta": b,
                 "steps": max(1, steps),
             }
+
+    def complete_batch(
+        self,
+        queries: Iterable[Iterable[float]],
+        beta: float | None = None,
+        mask: Iterable[int] | None = None,
+        steps: int = 1,
+        top_k: int = 5,
+        flt: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Vectorized :meth:`complete` over a batch of queries. The whole batch
+        is one matmul under a single lock — no per-query Python loop over the
+        attention step. Returns one result per input row, in order."""
+
+        with self._lock:
+            b = float(beta) if beta is not None else self.beta
+            Q = self._coerce_batch(queries)
+            m = Q.shape[0]
+            if m == 0:
+                return []
+            mask_arr = self._mask_from_indices(mask)
+            cand = self._candidates(flt) if self._X.shape[0] else None
+            if cand is None:
+                return [self._empty_complete(b, steps) for _ in range(m)]
+            Z, ids, meta = cand
+            Qz = self._normalize_query(Q)
+            recon_z, weights = retrieve(Z, Qz, b, mask_arr, steps)
+            recon = self._denormalize(recon_z)
+            results: list[dict[str, Any]] = []
+            for i in range(m):
+                contributors = self._contributors(weights[i], top_k, ids, meta)
+                results.append(
+                    {
+                        "reconstruction": recon[i].tolist(),
+                        "weights": contributors,
+                        "top": contributors[0] if contributors else None,
+                        "beta": b,
+                        "steps": max(1, steps),
+                    }
+                )
+            return results
 
     def search(
         self,
@@ -392,6 +765,11 @@ class Memory:
             if n == 0 or k <= 0:
                 return []
             q = self._coerce_vector(query)
+            # search deliberately ranks on the RAW vectors (cosine already
+            # normalizes magnitude away), independent of self.normalize. This
+            # keeps existing search results stable and avoids double-normalizing
+            # a zscore/l2 memory — the normalize mode only affects the Hopfield
+            # complete/anomaly path, not similarity search.
             if metric == "cosine":
                 if self._norms is None:
                     self._norms = np.linalg.norm(self._X, axis=1).astype(np.float32)
@@ -423,57 +801,234 @@ class Memory:
                 results.append(row)
             return results
 
+    def _anomaly_result(
+        self,
+        q: np.ndarray,
+        recon: np.ndarray,
+        qz: np.ndarray,
+        recon_z: np.ndarray,
+        weights: np.ndarray,
+        ids: list[str],
+        meta: list[dict[str, Any]],
+        b: float,
+        top_k: int,
+    ) -> dict[str, Any]:
+        """Assemble one anomaly report from a (single or per-row) recall result.
+
+        Shared by :meth:`anomaly` and :meth:`anomaly_batch` so a batch row is
+        element-for-element identical to the single-query call.
+        """
+
+        # Raw residual (original contract) and its normalized counterpart.
+        # z_residual is "how many std-devs off" per field, comparable across
+        # fields of different scale — the meaningful anomaly signal under
+        # zscore. For "none"/"l2" qz==q and recon_z==recon (l2 on the unit
+        # sphere), so the z-* figures coincide with the raw ones.
+        residual = np.abs(q - recon)
+        z_residual = np.abs(qz - recon_z)
+        score = float(np.linalg.norm(q - recon))
+        z_score = float(np.linalg.norm(qz - recon_z))
+        # Rank by the standardized deviation when zscore (cross-field
+        # comparable), otherwise by the raw deviation as before.
+        ranking = z_residual if self.normalize == "zscore" else residual
+        order = np.argsort(-ranking, kind="stable")
+        limit = min(max(top_k, 0), self.dimension)
+        fields = []
+        for idx in order[:limit]:
+            idx = int(idx)
+            fields.append(
+                {
+                    "index": idx,
+                    "name": self.fields[idx] if self.fields else None,
+                    "value": float(q[idx]),
+                    "expected": float(recon[idx]),
+                    "deviation": float(residual[idx]),
+                    "z_deviation": float(z_residual[idx]),
+                }
+            )
+        nearest = self._contributors(weights, 1, ids, meta)
+        return {
+            "score": score,
+            "z_score": z_score,
+            "reconstruction": recon.tolist(),
+            "residual": residual.tolist(),
+            "fields": fields,
+            "nearest": nearest[0] if nearest else None,
+            "beta": b,
+        }
+
     def anomaly(
         self,
         query: Iterable[float],
         beta: float | None = None,
         top_k: int = 5,
+        flt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Per-field anomaly detection.
 
         Recall the pattern the input most resembles, then report where the input
         deviates from that reconstruction field-by-field. Fields with the largest
-        absolute deviation are the most anomalous.
+        absolute deviation are the most anomalous. ``flt`` restricts recall to
+        patterns whose metadata matches (same syntax as :meth:`search`) — e.g.
+        score a record only against others of the same type.
         """
 
         with self._lock:
             b = float(beta) if beta is not None else self.beta
             if self._X.shape[0] == 0:
-                return {
-                    "score": 0.0,
-                    "reconstruction": None,
-                    "residual": [],
-                    "fields": [],
-                    "nearest": None,
-                    "beta": b,
-                }
+                return self._empty_anomaly(b)
             q = self._coerce_vector(query)
-            recon, weights = retrieve(self._X, q, b, None, 1)
-            residual = np.abs(q - recon)
-            score = float(np.linalg.norm(q - recon))
-            order = np.argsort(-residual, kind="stable")
-            limit = min(max(top_k, 0), self.dimension)
-            fields = []
-            for idx in order[:limit]:
-                idx = int(idx)
-                fields.append(
+            cand = self._candidates(flt)
+            if cand is None:
+                return self._empty_anomaly(b)
+            Z, ids, meta = cand
+            qz = self._normalize_query(q)
+            recon_z, weights = retrieve(Z, qz, b, None, 1)
+            recon = self._denormalize(recon_z)
+            return self._anomaly_result(q, recon, qz, recon_z, weights, ids, meta, b, top_k)
+
+    def anomaly_batch(
+        self,
+        queries: Iterable[Iterable[float]],
+        beta: float | None = None,
+        top_k: int = 5,
+        flt: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Vectorized :meth:`anomaly` over a batch of queries — one matmul under
+        a single lock. Returns one report per input row, in order."""
+
+        with self._lock:
+            b = float(beta) if beta is not None else self.beta
+            Q = self._coerce_batch(queries)
+            m = Q.shape[0]
+            if m == 0:
+                return []
+            cand = self._candidates(flt) if self._X.shape[0] else None
+            if cand is None:
+                return [self._empty_anomaly(b) for _ in range(m)]
+            Z, ids, meta = cand
+            Qz = self._normalize_query(Q)
+            recon_z, weights = retrieve(Z, Qz, b, None, 1)
+            recon = self._denormalize(recon_z)
+            return [
+                self._anomaly_result(
+                    Q[i], recon[i], Qz[i], recon_z[i], weights[i], ids, meta, b, top_k
+                )
+                for i in range(m)
+            ]
+
+    # -- capacity / saturation diagnostics -------------------------------
+    def capacity_report(self) -> dict[str, Any]:
+        """Hopfield storage-capacity / saturation diagnostic.
+
+        Modern Hopfield memories have finite capacity: past it, distinct
+        patterns' attractors merge and recall *silently* returns blends. This
+        reports honest signals of that:
+
+        * ``mean/max_pairwise_similarity`` — cosine similarity between (normalized)
+          stored patterns; a high max means those two will be confused at any β.
+        * ``self_recall_fail_fraction`` — fraction of sampled patterns that, when
+          queried with their *own* stored vector at the memory's β, do **not**
+          retrieve themselves with top weight ≥ 0.9. If a pattern can't recall
+          itself, the memory is over capacity for its β.
+        * ``suggested_beta`` — smallest β (coarse, heuristic search) at which the
+          sample self-recalls cleanly, or ``None`` if none of the tried β reach it.
+        * ``status`` — ``healthy`` (< 10% fail) / ``crowded`` (< 50%) / ``saturated``.
+
+        On large memories the pairwise and self-recall costs are bounded by
+        sampling ``_CAPACITY_SAMPLE`` patterns (deterministic seed). The result
+        is cached until the next mutation.
+        """
+
+        with self._lock:
+            if self._capacity is not None:
+                return copy.deepcopy(self._capacity)
+            n = self._X.shape[0]
+            report: dict[str, Any] = {
+                "count": n,
+                "dimension": self.dimension,
+                "beta": self.beta,
+                "normalize": self.normalize,
+                "sampled": min(n, _CAPACITY_SAMPLE),
+            }
+            if n == 0:
+                report.update(
                     {
-                        "index": idx,
-                        "name": self.fields[idx] if self.fields else None,
-                        "value": float(q[idx]),
-                        "expected": float(recon[idx]),
-                        "deviation": float(residual[idx]),
+                        "mean_pairwise_similarity": None,
+                        "max_pairwise_similarity": None,
+                        "self_recall_fail_fraction": 0.0,
+                        "suggested_beta": None,
+                        "status": "healthy",
                     }
                 )
-            nearest = self._contributors(weights, 1)
-            return {
-                "score": score,
-                "reconstruction": recon.tolist(),
-                "residual": residual.tolist(),
-                "fields": fields,
-                "nearest": nearest[0] if nearest else None,
-                "beta": b,
-            }
+                self._capacity = report
+                return copy.deepcopy(report)
+
+            Z = self._matrix_Z()
+            # Deterministic sample so the diagnostic is reproducible.
+            if n > _CAPACITY_SAMPLE:
+                rng = np.random.default_rng(0)
+                sample = np.sort(rng.choice(n, size=_CAPACITY_SAMPLE, replace=False))
+            else:
+                sample = np.arange(n)
+
+            # Pairwise cosine similarity among sampled (normalized) patterns.
+            rows = Z[sample].astype(np.float64)
+            unit = rows / np.maximum(np.linalg.norm(rows, axis=1, keepdims=True), _NORM_EPS)
+            sim = unit @ unit.T
+            k = sim.shape[0]
+            if k > 1:
+                off = sim[np.triu_indices(k, k=1)]
+                report["mean_pairwise_similarity"] = float(off.mean())
+                report["max_pairwise_similarity"] = float(off.max())
+            else:
+                report["mean_pairwise_similarity"] = 0.0
+                report["max_pairwise_similarity"] = 0.0
+
+            # Self-recall: query the FULL memory with each sampled pattern's own
+            # normalized vector; pre-softmax sims are reused across betas.
+            Qz = self._normalize_query(self._X[sample])
+            sims = (Qz @ Z.T).astype(np.float64)  # (sample, N)
+            rowidx = np.arange(sample.shape[0])
+
+            def fail_fraction(beta: float) -> float:
+                w = softmax(beta * sims, axis=1)
+                top_idx = np.argmax(w, axis=1)
+                top_w = w[rowidx, top_idx]
+                hits = (top_idx == sample) & (top_w >= _SELF_RECALL_THRESHOLD)
+                return float(1.0 - hits.mean())
+
+            fail = fail_fraction(self.beta)
+            report["self_recall_fail_fraction"] = fail
+            suggested = next(
+                (b for b in _CAPACITY_BETAS if fail_fraction(b) <= _CROWDED_FRACTION), None
+            )
+            report["suggested_beta"] = suggested
+            if fail >= _SATURATED_FRACTION:
+                report["status"] = "saturated"
+            elif fail >= _CROWDED_FRACTION:
+                report["status"] = "crowded"
+            else:
+                report["status"] = "healthy"
+
+            self._capacity = report
+            return copy.deepcopy(report)
+
+    def capacity_compact(self) -> dict[str, Any]:
+        """The headline capacity fields for /stats and /health (cached)."""
+
+        full = self.capacity_report()
+        return {
+            "status": full["status"],
+            "self_recall_fail_fraction": full["self_recall_fail_fraction"],
+        }
+
+    def capacity_status_cached(self) -> str | None:
+        """Capacity status if already computed, else None — never triggers the
+        (potentially heavy) recompute. For the liveness path (/health)."""
+
+        with self._lock:
+            return self._capacity["status"] if self._capacity else None
 
     # -- (de)serialisation for single-file persistence -------------------
     def snapshot(self) -> MemorySnapshot:
@@ -489,10 +1044,12 @@ class Memory:
                 dimension=self.dimension,
                 beta=self.beta,
                 fields=list(self.fields) if self.fields else None,
+                normalize=self.normalize,
                 ids=list(self.ids),
                 metadata=[dict(m) for m in self.metadata],
                 matrix=self._X.copy(),
                 version=self._version,
+                collection=self.collection,
             )
 
     def mark_saved(self, version: int) -> None:
@@ -512,6 +1069,10 @@ class Memory:
             manifest["dimension"],
             manifest.get("beta", 8.0),
             manifest.get("fields"),
+            # Legacy files predate this key → "none", preserving exact prior
+            # behaviour. Pass it explicitly so the fields-based default-selection
+            # rule never silently upgrades a loaded raw-vector memory to zscore.
+            manifest.get("normalize", "none"),
         )
         ids = list(manifest["ids"])
         metadata = list(manifest["metadata"])
@@ -531,16 +1092,48 @@ class Memory:
         mem.metadata = metadata
         mem._index = {i: j for j, i in enumerate(mem.ids)}
         mem._X = matrix.astype(np.float32, copy=False)
+        # Restore collection provenance/attestation if this memory was loaded
+        # from a bundle (additive key; absent on plain/legacy memories).
+        mem.collection = manifest.get("collection")
         # Loaded state mirrors disk, so it starts clean (version 0 == saved 0).
         return mem
+
+
+def peek_manifest_version(path: str | Path) -> int | None:
+    """Read just the manifest version from a data file without loading memories.
+    Returns ``None`` if the file is absent or has no readable manifest."""
+
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as handle:
+            with np.load(handle, allow_pickle=False) as data:
+                if "__manifest__" not in data:
+                    return None
+                manifest = json.loads(bytes(data["__manifest__"]).decode("utf-8"))
+                version = manifest.get("version")
+                return int(version) if version is not None else None
+    except Exception:
+        return None
 
 
 class NeuroStore:
     """Owns every :class:`Memory` and persists them all to a single ``.npz`` file."""
 
-    def __init__(self, data_file: str | Path, fail_on_corrupt_load: bool = False) -> None:
+    def __init__(
+        self,
+        data_file: str | Path,
+        fail_on_corrupt_load: bool = False,
+        max_patterns_per_memory: int = 0,
+        max_total_bytes: int = 0,
+    ) -> None:
         self.data_file = Path(data_file)
         self.fail_on_corrupt_load = fail_on_corrupt_load
+        # Resource ceilings (0 = unlimited); enforced by check_write before any
+        # allocation, so a runaway writer is rejected rather than OOM-killing.
+        self.max_patterns_per_memory = max_patterns_per_memory
+        self.max_total_bytes = max_total_bytes
         self._memories: dict[str, Memory] = {}
         self._lock = threading.RLock()
         # Readiness signal: did the most recent persist succeed?
@@ -549,14 +1142,62 @@ class NeuroStore:
 
     # -- memory lifecycle -------------------------------------------------
     def create_memory(
-        self, name: str, dimension: int, beta: float = 8.0, fields: list[str] | None = None
+        self,
+        name: str,
+        dimension: int,
+        beta: float = 8.0,
+        fields: list[str] | None = None,
+        normalize: str | None = None,
     ) -> Memory:
         with self._lock:
             validate_name(name)
             if name in self._memories:
                 raise MemoryError_(f"Memory {name!r} already exists.")
-            mem = Memory(name, dimension, beta, fields)
+            mem = Memory(name, dimension, beta, fields, normalize)
             self._memories[name] = mem
+            self.save()
+            return mem
+
+    def load_collection(self, bundle_path: str | Path, name: str | None = None) -> Memory:
+        """Materialize a memory from a signed/validated collection bundle.
+
+        Verifies the signature (via the active license seam), enforces required
+        provenance, then loads the patterns + schema as a ready-to-score memory.
+        """
+
+        from .collections import bundle as bundle_mod
+        from .collections.license import get_license
+
+        manifest = bundle_mod.read_manifest(bundle_path)
+        bundle_mod.validate_manifest(manifest)  # required provenance, etc.
+        verification = bundle_mod.verify_bundle(bundle_path)
+        get_license().check(manifest, verification)
+
+        patterns = bundle_mod.read_patterns(bundle_path)
+        coll_name = name or manifest["name"]
+        fields = [f["name"] for f in manifest["schema"]["fields"]]
+        att = manifest.get("attestation")
+        with self._lock:
+            if coll_name in self._memories:
+                raise MemoryError_(f"Memory {coll_name!r} already exists.")
+            mem = Memory(
+                coll_name,
+                manifest["dimension"],
+                float(manifest.get("beta", 8.0)),
+                fields,
+                manifest.get("normalize"),
+            )
+            # A bundle is an external write source — enforce the same ceilings.
+            self.check_write(coll_name, len(patterns), mem.dimension, mem.normalize)
+            mem.write([{"vector": row.tolist()} for row in patterns])
+            mem.collection = {
+                "criteria": manifest.get("criteria"),
+                "provenance": manifest.get("provenance"),
+                "schema": manifest.get("schema"),
+                "attested": bool(att),
+                "signature": verification.to_dict(),
+            }
+            self._memories[coll_name] = mem
             self.save()
             return mem
 
@@ -579,6 +1220,13 @@ class NeuroStore:
         with self._lock:
             return len(self._memories)
 
+    def counts(self) -> tuple[int, int]:
+        """Cheap ``(memories, patterns)`` totals without the capacity diagnostic
+        (used by hot endpoints like /metrics)."""
+
+        with self._lock:
+            return len(self._memories), sum(m.count for m in self._memories.values())
+
     def delete_memory(self, name: str) -> None:
         with self._lock:
             if name not in self._memories:
@@ -586,13 +1234,104 @@ class NeuroStore:
             del self._memories[name]
             self.save()
 
+    def approx_total_bytes(self) -> int:
+        """Estimated in-process footprint across all memories (matrices + caches)."""
+
+        with self._lock:
+            return sum(m.approx_bytes for m in self._memories.values())
+
+    def check_write(self, name: str, n_new: int, dimension: int, normalize: str) -> None:
+        """Reject — before allocating — a write that would breach a ceiling.
+
+        ``n_new`` is the upper bound on rows added (the request item count, since
+        id de-duplication can only reduce it). Raises :class:`LimitExceededError`
+        (HTTP 413); reads and existing data are unaffected.
+        """
+
+        if self.max_patterns_per_memory <= 0 and self.max_total_bytes <= 0:
+            return
+        with self._lock:
+            existing = self._memories.get(name)
+            current = existing.count if existing else 0
+            if (
+                self.max_patterns_per_memory > 0
+                and current + n_new > self.max_patterns_per_memory
+            ):
+                raise LimitExceededError(
+                    f"write to memory {name!r} would exceed "
+                    f"NEURODB_MAX_PATTERNS_PER_MEMORY ({self.max_patterns_per_memory}): "
+                    f"{current} existing + {n_new} new."
+                )
+            if self.max_total_bytes > 0:
+                per_row = dimension * 4 * (2 if normalize != "none" else 1)
+                added = n_new * per_row
+                total = self.approx_total_bytes()
+                if total + added > self.max_total_bytes:
+                    raise LimitExceededError(
+                        f"write to memory {name!r} would exceed "
+                        f"NEURODB_MAX_TOTAL_BYTES ({self.max_total_bytes}): "
+                        f"~{total} current + ~{added} new bytes."
+                    )
+
+    def write(self, name: str, items: list[dict[str, Any]]) -> list[str]:
+        """Append patterns with the resource-ceiling check applied atomically.
+
+        Holding the store lock across both the check and the append closes the
+        TOCTOU window (two concurrent writes can't both pass the same ceiling)
+        and makes the limit unbypassable — every external write path goes through
+        here, not straight to ``Memory.write``.
+        """
+
+        with self._lock:
+            mem = self.get_memory(name)
+            self.check_write(name, len(items), mem.dimension, mem.normalize)
+            return mem.write(items)
+
+    def health_summary(self) -> dict[str, Any]:
+        """Cheap liveness + footprint summary for /health.
+
+        Deliberately avoids the per-memory capacity diagnostic (matmuls,
+        recomputed after every write) that /stats runs — ``saturated_memories``
+        counts only memories whose capacity is *already* cached, so a liveness
+        probe never triggers heavy compute.
+        """
+
+        with self._lock:
+            mems = list(self._memories.values())
+            total_bytes = sum(m.approx_bytes for m in mems)
+            budget = self.max_total_bytes
+            return {
+                "memories": len(mems),
+                "patterns": sum(m.count for m in mems),
+                "approx_bytes": total_bytes,
+                "saturated_memories": sum(
+                    1 for m in mems if m.capacity_status_cached() == "saturated"
+                ),
+                "pct_of_budget": (
+                    round(100.0 * total_bytes / budget, 2) if budget > 0 else None
+                ),
+            }
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            memories = [mem.info() for mem in self._memories.values()]
+            # Per-memory detail carries the normalize mode and, for zscore, the
+            # per-dimension mean/std (handy for debugging an anomaly flag).
+            memories = [mem.stats() for mem in self._memories.values()]
+            total_bytes = sum(m["approx_bytes"] for m in memories)
+            budget = self.max_total_bytes
+            for m in memories:
+                m["pct_of_budget"] = (
+                    round(100.0 * m["approx_bytes"] / budget, 2) if budget > 0 else None
+                )
             return {
                 "memories": len(memories),
                 "patterns": sum(m["count"] for m in memories),
                 "data_file": str(self.data_file),
+                "approx_bytes": total_bytes,
+                "max_total_bytes": budget or None,
+                "pct_of_budget": (
+                    round(100.0 * total_bytes / budget, 2) if budget > 0 else None
+                ),
                 "detail": memories,
             }
 
@@ -629,13 +1368,28 @@ class NeuroStore:
                     raise StoreError("data file is missing its __manifest__ entry.")
                 manifest = json.loads(bytes(data["__manifest__"]).decode("utf-8"))
                 version = manifest.get("version")
-                if version is None or version > _MANIFEST_VERSION:
-                    raise StoreError(f"unsupported manifest version {version!r}.")
+                if version is None:
+                    raise StoreError("data file manifest is missing its version.")
+                if version > _MANIFEST_VERSION:
+                    raise StoreError(
+                        f"data file was written by a newer NeuroDB (manifest "
+                        f"v{version}); this build supports up to v{_MANIFEST_VERSION}. "
+                        "Upgrade NeuroDB or restore an older backup."
+                    )
+                # Bring an older file forward in memory before building memories.
+                # Non-destructive: the source file is untouched; the upgraded
+                # version is stamped on the next normal save.
+                arrays: dict[str, np.ndarray] | Any = data
+                if version < _MANIFEST_VERSION:
+                    arrays = {k: data[k] for k in data.files if k != "__manifest__"}
+                    manifest, arrays = migrate(
+                        manifest, arrays, target_version=_MANIFEST_VERSION
+                    )
                 for entry in manifest.get("memories", []):
                     key = f"X@{entry['name']}"
-                    if key not in data:
+                    if key not in arrays:
                         raise StoreError(f"missing matrix for memory {entry['name']!r}.")
-                    mem = Memory.from_manifest(entry, data[key])
+                    mem = Memory.from_manifest(entry, arrays[key])
                     loaded[mem.name] = mem
         # Commit only after the whole file parses + validates (all-or-nothing).
         self._memories.update(loaded)

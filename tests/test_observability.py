@@ -38,6 +38,46 @@ def test_metrics_and_ready_are_public(auth_client):
     assert auth_client.get("/metrics").status_code == 200
 
 
+def test_hot_path_latency_and_op_metrics(client):
+    client.post("/v1/memories", json={"name": "m", "dimension": 2})
+    client.post("/v1/memories/m/patterns", json={"items": [{"id": "a", "vector": [1, 0]}]})
+    client.post("/v1/memories/m/anomaly/batch", json={"items": [{"vector": [1, 0]}]})
+    body = client.get("/metrics").text
+    # Per-route latency histogram and the new batch-size / op counters populate.
+    assert "neurodb_http_request_duration_seconds" in body
+    assert "neurodb_batch_size" in body
+    assert 'neurodb_ops_total{op="write"}' in body
+
+
+def test_slowlog_captures_and_omits_contents(client_factory):
+    # threshold 0 → every data op is recorded.
+    client = client_factory(allow_anonymous=True, slowlog_ms=0.0)
+    client.post("/v1/memories", json={"name": "m", "dimension": 2})
+    client.post(
+        "/v1/memories/m/anomaly/batch",
+        json={"items": [{"vector": [1, 0]}, {"vector": [0, 1]}]},
+    )
+
+    body = client.get("/v1/slowlog").json()
+    assert body["threshold_ms"] == 0.0
+    assert body["entries"], "expected slow entries"
+
+    entry = body["entries"][-1]
+    # Shape metadata only — never record contents.
+    allowed = {
+        "ts", "duration_ms", "request_id", "method",
+        "route", "status", "memory", "batch_size", "pattern_count",
+    }
+    assert set(entry) <= allowed
+    assert entry["memory"] == "m"
+    assert entry["batch_size"] == 2
+
+
+def test_slowlog_is_auth_guarded(auth_client):
+    # No API key header → 401 (slowlog is on the auth-protected data router).
+    assert auth_client.get("/v1/slowlog").status_code == 401
+
+
 def test_json_formatter_includes_request_id():
     formatter = JsonFormatter()
     record = logging.LogRecord("n", logging.INFO, __file__, 1, "hello", None, None)

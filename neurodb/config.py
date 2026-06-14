@@ -78,6 +78,21 @@ class Settings:
     rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int("NEURODB_RATE_LIMIT_PER_MINUTE", 600)
     )
+    # Max items in a single /anomaly/batch or /complete/batch request.
+    max_batch: int = field(default_factory=lambda: _env_int("NEURODB_MAX_BATCH", 1024))
+    # Resource ceilings (0 = unlimited). Writes that would breach these are
+    # rejected before allocating; reads keep serving.
+    max_patterns_per_memory: int = field(
+        default_factory=lambda: _env_int("NEURODB_MAX_PATTERNS_PER_MEMORY", 1_000_000)
+    )
+    max_total_bytes: int = field(
+        default_factory=lambda: _env_int("NEURODB_MAX_TOTAL_BYTES", 0)
+    )
+    # /health flips "memory_pressure" once footprint reaches this % of the byte
+    # budget (only meaningful when NEURODB_MAX_TOTAL_BYTES is set).
+    memory_pressure_pct: float = field(
+        default_factory=lambda: _env_float("NEURODB_MEMORY_PRESSURE_PCT", 90.0)
+    )
     # Fail-closed on an unreadable data file instead of quarantining + empty start.
     fail_on_corrupt_load: bool = field(
         default_factory=lambda: _env_bool("NEURODB_FAIL_ON_CORRUPT_LOAD", False)
@@ -85,6 +100,18 @@ class Settings:
     embedding_dim: int = field(default_factory=lambda: _env_int("NEURODB_EMBEDDING_DIM", 256))
     log_level: str = field(default_factory=lambda: _env_str("NEURODB_LOG_LEVEL", "info"))
     log_format: str = field(default_factory=lambda: _env_str("NEURODB_LOG_FORMAT", "json"))
+    # Where POST /v1/backup writes snapshots (timestamped files inside this dir).
+    backup_dir: str = field(
+        default_factory=lambda: _env_str("NEURODB_BACKUP_DIR", "./data/backups")
+    )
+    # Data operations slower than this (ms) are recorded in the slowlog.
+    slowlog_ms: float = field(
+        default_factory=lambda: _env_float("NEURODB_SLOWLOG_MS", 200.0)
+    )
+    # Max entries retained in the in-memory slowlog ring buffer.
+    slowlog_size: int = field(
+        default_factory=lambda: _env_int("NEURODB_SLOWLOG_SIZE", 100)
+    )
 
 
 def get_settings() -> Settings:

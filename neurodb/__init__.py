@@ -9,4 +9,39 @@ deduplication.
 
 __version__ = "0.1.0"
 
-__all__ = ["__version__"]
+# Re-export the Python client so the installed package users `pip install` —
+# `neurodb` — exposes the high-level API directly:
+#
+#     from neurodb import connect, ValidationReport
+#
+# `neurodb_client` remains the dependency-free implementation home.
+from neurodb_client import (  # noqa: E402
+    BadRequest,
+    Client,
+    FieldResult,
+    Memory,
+    NeuroDBError,
+    NotFound,
+    RecordResult,
+    Unauthorized,
+    ValidationReport,
+    connect,
+    run_validation,
+    telemetry,
+)
+
+__all__ = [
+    "__version__",
+    "connect",
+    "Client",
+    "Memory",
+    "NeuroDBError",
+    "BadRequest",
+    "NotFound",
+    "Unauthorized",
+    "run_validation",
+    "ValidationReport",
+    "RecordResult",
+    "FieldResult",
+    "telemetry",
+]

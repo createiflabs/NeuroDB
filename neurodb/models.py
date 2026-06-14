@@ -36,6 +36,15 @@ class CreateMemoryRequest(BaseModel):
         max_length=MAX_DIMENSION,
         description="Optional per-dimension field names (len must equal dimension).",
     )
+    normalize: Literal["none", "zscore", "l2"] | None = Field(
+        None,
+        description=(
+            "Pattern normalization applied before Hopfield recall. 'zscore' "
+            "(per-dimension standardize) is recommended for structured records; "
+            "'l2' for unit-direction embeddings; 'none' for the raw dot product. "
+            "Omit to default to 'zscore' when 'fields' is given, else 'none'."
+        ),
+    )
 
 
 class PatternItem(BaseModel):
@@ -73,6 +82,35 @@ class CompleteRequest(BaseModel):
     )
     steps: int = Field(1, ge=1, le=64)
     top_k: int = Field(5, ge=0, le=1000)
+    filter: dict[str, Any] | None = Field(
+        None, description="Restrict recall to patterns whose metadata matches."
+    )
+
+
+class QueryItem(BaseModel):
+    """One vector in a batch recall request; ``id`` is echoed back per result."""
+
+    id: str | None = Field(None, max_length=ID_MAX)
+    vector: list[float] = Field(..., min_length=1, max_length=MAX_DIMENSION)
+
+    @field_validator("vector")
+    @classmethod
+    def _finite_vector(cls, v: list[float]) -> list[float]:
+        if not all(math.isfinite(x) for x in v):
+            raise ValueError("vector must contain only finite numbers")
+        return v
+
+
+class CompleteBatchRequest(BaseModel):
+    # Empty batch is allowed (→ 200 with results: []); the per-request cap is
+    # enforced against NEURODB_MAX_BATCH in the route (config-driven, like the
+    # request-bytes limit), not as a static schema bound.
+    items: list[QueryItem] = Field(default_factory=list)
+    beta: float | None = Field(None, gt=0)
+    mask: list[int] | None = Field(None, min_length=1, max_length=MAX_DIMENSION)
+    steps: int = Field(1, ge=1, le=64)
+    top_k: int = Field(5, ge=0, le=1000)
+    filter: dict[str, Any] | None = None
 
 
 class SearchRequest(BaseModel):
@@ -87,6 +125,38 @@ class AnomalyRequest(BaseModel):
     query: list[float] = Field(..., min_length=1, max_length=MAX_DIMENSION)
     beta: float | None = Field(None, gt=0)
     top_k: int = Field(5, ge=0, le=1000)
+    filter: dict[str, Any] | None = Field(
+        None, description="Restrict recall to patterns whose metadata matches."
+    )
+
+
+class AnomalyBatchRequest(BaseModel):
+    items: list[QueryItem] = Field(default_factory=list)
+    beta: float | None = Field(None, gt=0)
+    top_k: int = Field(5, ge=0, le=1000)
+    filter: dict[str, Any] | None = None
+
+
+class PatternUpdate(BaseModel):
+    """Partial update for a stored pattern. At least one of vector/metadata."""
+
+    vector: list[float] | None = Field(None, min_length=1, max_length=MAX_DIMENSION)
+    metadata: dict[str, Any] | None = None
+    merge_metadata: bool = Field(
+        True, description="Shallow-merge metadata into existing (False replaces)."
+    )
+
+    @field_validator("vector")
+    @classmethod
+    def _finite_vector(cls, v: list[float] | None) -> list[float] | None:
+        if v is not None and not all(math.isfinite(x) for x in v):
+            raise ValueError("vector must contain only finite numbers")
+        return v
+
+    @field_validator("metadata")
+    @classmethod
+    def _bounded_metadata(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _check_metadata_size(v) if v is not None else v
 
 
 class TextItem(BaseModel):
@@ -113,3 +183,12 @@ class TextSearchRequest(BaseModel):
 
 class EmbedRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=TEXT_MAX)
+
+
+class CollectionLoadRequest(BaseModel):
+    """Load a collection bundle from a server-accessible path into a memory."""
+
+    path: str = Field(..., min_length=1, max_length=4096, description="Server-side bundle path.")
+    name: str | None = Field(
+        None, max_length=128, description="Override the collection's name on load."
+    )

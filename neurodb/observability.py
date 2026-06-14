@@ -6,9 +6,12 @@ The metrics layer is optional — if ``prometheus_client`` is not installed the
 
 from __future__ import annotations
 
+import collections
 import contextvars
 import json
 import logging
+import threading
+import time
 from typing import Any
 
 # Request id for the in-flight request, surfaced in every log line.
@@ -98,12 +101,37 @@ class Metrics:
             ["result"],
             registry=self.registry,
         )
+        # Batch-size distribution per batch route (spot misuse / tune limits).
+        self.batch_size = Histogram(
+            "neurodb_batch_size",
+            "Items per batch request, by route.",
+            ["path"],
+            buckets=(1, 8, 32, 128, 512, 1024, 4096),
+            registry=self.registry,
+        )
+        # Data-mutation counters (low cardinality: by op, not by memory name).
+        self.ops = Counter(
+            "neurodb_ops_total",
+            "Data operations by kind (write/delete/update).",
+            ["op"],
+            registry=self.registry,
+        )
 
     def observe_request(self, method: str, path: str, status: int, duration: float) -> None:
         if not self.enabled:
             return
         self.requests.labels(method, path, str(status)).inc()
         self.latency.labels(method, path).observe(duration)
+
+    def observe_batch(self, path: str, size: int) -> None:
+        if not self.enabled:
+            return
+        self.batch_size.labels(path).observe(size)
+
+    def record_op(self, op: str) -> None:
+        if not self.enabled:
+            return
+        self.ops.labels(op).inc()
 
     def record_save(self, ok: bool) -> None:
         if not self.enabled:
@@ -116,3 +144,30 @@ class Metrics:
         self.memories.set(memories)
         self.patterns.set(patterns)
         return generate_latest(self.registry)
+
+
+class SlowLog:
+    """A bounded, in-memory ring buffer of slow data operations (Redis SLOWLOG
+    equivalent). Entries carry timing + shape metadata only — never record
+    contents — and the newest evicts the oldest past ``maxlen``."""
+
+    def __init__(self, threshold_ms: float, maxlen: int) -> None:
+        self.threshold_ms = threshold_ms
+        self._buf: collections.deque[dict[str, Any]] = collections.deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self._logger = logging.getLogger("neurodb.slowlog")
+
+    def record(self, duration_ms: float, **fields: Any) -> None:
+        """Record an op if it crossed the threshold. Returns silently otherwise."""
+
+        if duration_ms < self.threshold_ms:
+            return
+        entry = {"ts": time.time(), "duration_ms": round(duration_ms, 2), **fields}
+        with self._lock:
+            self._buf.append(entry)
+        self._logger.warning("slow operation", extra={"slowlog": entry})
+
+    def recent(self, limit: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            items = list(self._buf)
+        return items[-limit:] if limit else items

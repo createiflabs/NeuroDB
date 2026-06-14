@@ -37,6 +37,11 @@ dev = [
     "pip-audit>=2.10.1",
 ]
 ann = ["hnswlib>=0.8"]  # optional approximate-nearest-neighbour backend (future)
+# Optional data-stack adapters for client-side validation (neurodb_client.integrations).
+great-expectations = ["great-expectations>=0.18"]
+airflow = ["apache-airflow>=2.7"]
+dagster = ["dagster>=1.6"]
+integrations = ["great-expectations>=0.18", "apache-airflow>=2.7", "dagster>=1.6"]
 
 [project.scripts]
 neurodb = "neurodb.__main__:main"
@@ -47,7 +52,7 @@ Source = "https://github.com/createiflabs/NeuroDB"
 Issues = "https://github.com/createiflabs/NeuroDB/issues"
 
 [tool.setuptools.packages.find]
-include = ["neurodb*"]
+include = ["neurodb*", "neurodb_client*"]
 
 [tool.setuptools.package-data]
 neurodb = ["static/*"]

@@ -87,6 +87,10 @@ class Settings:
     embedding_dim: int = field(default_factory=lambda: _env_int("NEURODB_EMBEDDING_DIM", 256))
     log_level: str = field(default_factory=lambda: _env_str("NEURODB_LOG_LEVEL", "info"))
     log_format: str = field(default_factory=lambda: _env_str("NEURODB_LOG_FORMAT", "json"))
+    # Where POST /v1/backup writes snapshots (timestamped files inside this dir).
+    backup_dir: str = field(
+        default_factory=lambda: _env_str("NEURODB_BACKUP_DIR", "./data/backups")
+    )
 
 
 def get_settings() -> Settings:

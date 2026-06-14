@@ -335,6 +335,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def stats():
         return store.stats()
 
+    @api.post("/backup", tags=["system"])
+    async def backup(download: bool = Query(False)):
+        """Write a consistent snapshot to the configured backup dir (admin: same
+        API key as the data API). With ``?download=true`` the snapshot is streamed
+        back instead of just its path being returned. Restore is CLI-only."""
+
+        from .backup import backup_store
+
+        target = await run_in_threadpool(backup_store, store, settings.backup_dir)
+        if download:
+            return FileResponse(
+                target, media_type="application/octet-stream", filename=target.name
+            )
+        return {"path": str(target), "bytes": target.stat().st_size}
+
     @api.post("/flush", tags=["system"])
     async def flush():
         """Synchronously persist all dirty memories (fsync-durable) and report

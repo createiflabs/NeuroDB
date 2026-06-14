@@ -36,6 +36,30 @@ logger = logging.getLogger("neurodb.store")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MANIFEST_VERSION = 1
 
+# Per-memory normalization modes applied before the Hopfield attention step.
+NORMALIZE_MODES = ("none", "zscore", "l2")
+# Floor for per-dimension std / row norm so a degenerate (constant / zero)
+# dimension or pattern never produces a division by zero (NaN/inf).
+_NORM_EPS = 1e-6
+
+
+def resolve_normalize(normalize: str | None, fields: list[str] | None) -> str:
+    """Resolve the effective normalization mode.
+
+    ``None`` selects the structured-record-friendly default: ``"zscore"`` when
+    per-dimension ``fields`` are given (a strong signal the rows are real-world
+    records on disparate scales), otherwise ``"none"`` (raw dot product, the
+    pre-patch behaviour — e.g. for already unit-norm embeddings).
+    """
+
+    if normalize is None:
+        return "zscore" if fields else "none"
+    if normalize not in NORMALIZE_MODES:
+        raise MemoryError_(
+            f"normalize must be one of {NORMALIZE_MODES}, got {normalize!r}."
+        )
+    return normalize
+
 
 class StoreError(Exception):
     """Base class for storage-layer errors (maps to HTTP 400)."""
@@ -143,6 +167,7 @@ class MemorySnapshot:
     dimension: int
     beta: float
     fields: list[str] | None
+    normalize: str
     ids: list[str]
     metadata: list[dict[str, Any]]
     matrix: np.ndarray
@@ -154,6 +179,10 @@ class MemorySnapshot:
             "dimension": self.dimension,
             "beta": self.beta,
             "fields": self.fields,
+            # Additive, optional key: legacy files omit it and load as "none".
+            # mean/std/Z are NOT persisted — they are recomputed from the matrix
+            # on load, so the file can never carry stale statistics.
+            "normalize": self.normalize,
             "ids": self.ids,
             "metadata": self.metadata,
         }
@@ -168,6 +197,7 @@ class Memory:
         dimension: int,
         beta: float = 8.0,
         fields: list[str] | None = None,
+        normalize: str | None = None,
     ) -> None:
         validate_name(name)
         if int(dimension) <= 0:
@@ -182,12 +212,23 @@ class Memory:
         self.dimension = int(dimension)
         self.beta = float(beta)
         self.fields: list[str] | None = list(fields) if fields else None
+        # How patterns are scaled before the Hopfield step (see module-level
+        # NORMALIZE_MODES). Defaults to "zscore" for structured records (fields
+        # given), "none" otherwise; legacy loads resolve to "none".
+        self.normalize = resolve_normalize(normalize, self.fields)
         self.ids: list[str] = []
         self.metadata: list[dict[str, Any]] = []
         self._index: dict[str, int] = {}
         self._X = np.zeros((0, self.dimension), dtype=np.float32)
         # Cached per-row L2 norms for cosine search; invalidated on mutation.
         self._norms: np.ndarray | None = None
+        # Normalization caches, recomputed from self._X on demand and
+        # invalidated alongside self._norms on every mutation. _Z is the
+        # normalized matrix the Hopfield step runs on; _mean/_std are the
+        # per-dimension zscore statistics used to (de)normalize queries.
+        self._Z: np.ndarray | None = None
+        self._mean: np.ndarray | None = None
+        self._std: np.ndarray | None = None
         self._lock = threading.RLock()
         # Monotonic write version vs. the version last persisted. A memory is
         # dirty when they differ. This (rather than a bare bool) means a write
@@ -211,7 +252,75 @@ class Memory:
             "beta": self.beta,
             "fields": self.fields,
             "count": self.count,
+            "normalize": self.normalize,
         }
+
+    def stats(self) -> dict[str, Any]:
+        """:meth:`info` plus, for ``zscore`` memories, the per-dimension
+        ``mean``/``std`` used to normalize — useful for debugging why a given
+        field was (or wasn't) flagged as anomalous."""
+
+        with self._lock:
+            detail = self.info()
+            if self.normalize == "zscore":
+                self._ensure_stats()
+                detail["mean"] = self._mean.tolist() if self._mean is not None else None
+                detail["std"] = self._std.tolist() if self._std is not None else None
+            return detail
+
+    # -- normalization ----------------------------------------------------
+    def _ensure_stats(self) -> None:
+        """Compute and cache the normalized matrix ``_Z`` (and, for zscore, the
+        ``_mean``/``_std`` statistics) from the current matrix. Must be called
+        under ``self._lock``. A no-op for ``"none"`` mode (the Hopfield step runs
+        on the raw matrix, exactly as before this patch)."""
+
+        if self.normalize == "none" or self._Z is not None:
+            return
+        X = self._X
+        if self.normalize == "zscore":
+            if X.shape[0] < 2:
+                # std is undefined with <2 patterns → identity transform, so
+                # the memory behaves like "none" until there is data to estimate
+                # the statistics from.
+                self._mean = np.zeros(self.dimension, dtype=np.float32)
+                self._std = np.ones(self.dimension, dtype=np.float32)
+            else:
+                self._mean = X.mean(axis=0).astype(np.float32)
+                # Floor the std so a constant dimension (zero variance) maps to 0
+                # in normalized space rather than producing NaN/inf: it then
+                # contributes nothing to similarity, which is correct.
+                self._std = np.maximum(X.std(axis=0), _NORM_EPS).astype(np.float32)
+            self._Z = ((X - self._mean) / self._std).astype(np.float32)
+        else:  # "l2": project every row onto the unit sphere
+            norms = np.maximum(np.linalg.norm(X, axis=1, keepdims=True), _NORM_EPS)
+            self._Z = (X / norms).astype(np.float32)
+
+    def _normalized(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(Z, qz)``: the matrix and query in normalized space for the
+        active mode. Must be called under ``self._lock``. For ``"none"`` this is
+        ``(self._X, q)`` unchanged, so that path is bit-for-bit identical."""
+
+        if self.normalize == "none":
+            return self._X, q
+        self._ensure_stats()
+        if self.normalize == "zscore":
+            qz = ((q - self._mean) / self._std).astype(np.float32)
+            return self._Z, qz
+        # "l2": unit-normalize the query (a zero query stays zero).
+        qn = float(np.linalg.norm(q))
+        qz = (q / qn).astype(np.float32) if qn > _NORM_EPS else q.astype(np.float32)
+        return self._Z, qz
+
+    def _denormalize(self, recon_z: np.ndarray) -> np.ndarray:
+        """Map a reconstruction from normalized space back to raw units. For
+        ``zscore`` this inverts the standardization; for ``none`` and ``l2`` the
+        reconstruction is already returned as-is (an l2 recon is directional and
+        lives on the unit sphere, *not* in the original magnitude units)."""
+
+        if self.normalize == "zscore":
+            return (recon_z * self._std + self._mean).astype(np.float32)
+        return recon_z
 
     # -- validation helpers ----------------------------------------------
     def _coerce_vector(self, vector: Iterable[float]) -> np.ndarray:
@@ -240,6 +349,16 @@ class Memory:
                 raise MemoryError_(f"duplicate mask index {raw}.")
             mask[i] = True
         return mask
+
+    def _invalidate_caches(self) -> None:
+        """Drop every matrix-derived cache after a mutation. Must be called
+        under ``self._lock``; the same invalidation point for all of them keeps
+        the norms and the normalization statistics consistent with ``self._X``."""
+
+        self._norms = None
+        self._Z = None
+        self._mean = None
+        self._std = None
 
     # -- writing (append a pattern) --------------------------------------
     def write(self, items: Iterable[dict[str, Any]]) -> list[str]:
@@ -284,7 +403,7 @@ class Memory:
                 self.ids.extend(new_ids)
                 self.metadata.extend(new_meta)
 
-            self._norms = None  # invalidate cached norms
+            self._invalidate_caches()
             self._version += 1
             return list(affected)
 
@@ -313,7 +432,7 @@ class Memory:
             self.ids = [i for j, i in enumerate(self.ids) if mask[j]]
             self.metadata = [m for j, m in enumerate(self.metadata) if mask[j]]
             self._index = {i: j for j, i in enumerate(self.ids)}
-            self._norms = None  # invalidate cached norms
+            self._invalidate_caches()
             self._version += 1
             return len(targets)
 
@@ -367,7 +486,13 @@ class Memory:
                 }
             q = self._coerce_vector(query)
             mask_arr = self._mask_from_indices(mask)
-            recon, weights = retrieve(self._X, q, b, mask_arr, steps)
+            # Run the Hopfield step in normalized space, then map the result
+            # back to raw units. The mask clamp inside retrieve() therefore
+            # clamps in normalized space (qz[mask]); de-normalizing afterwards
+            # restores the known fields to their exact raw values.
+            Z, qz = self._normalized(q)
+            recon_z, weights = retrieve(Z, qz, b, mask_arr, steps)
+            recon = self._denormalize(recon_z)
             contributors = self._contributors(weights, top_k)
             return {
                 "reconstruction": recon.tolist(),
@@ -392,6 +517,11 @@ class Memory:
             if n == 0 or k <= 0:
                 return []
             q = self._coerce_vector(query)
+            # search deliberately ranks on the RAW vectors (cosine already
+            # normalizes magnitude away), independent of self.normalize. This
+            # keeps existing search results stable and avoids double-normalizing
+            # a zscore/l2 memory — the normalize mode only affects the Hopfield
+            # complete/anomaly path, not similarity search.
             if metric == "cosine":
                 if self._norms is None:
                     self._norms = np.linalg.norm(self._X, axis=1).astype(np.float32)
@@ -441,6 +571,7 @@ class Memory:
             if self._X.shape[0] == 0:
                 return {
                     "score": 0.0,
+                    "z_score": 0.0,
                     "reconstruction": None,
                     "residual": [],
                     "fields": [],
@@ -448,10 +579,22 @@ class Memory:
                     "beta": b,
                 }
             q = self._coerce_vector(query)
-            recon, weights = retrieve(self._X, q, b, None, 1)
+            Z, qz = self._normalized(q)
+            recon_z, weights = retrieve(Z, qz, b, None, 1)
+            recon = self._denormalize(recon_z)
+            # Raw residual (original contract) and its normalized counterpart.
+            # z_residual is "how many std-devs off" per field, comparable across
+            # fields of different scale — the meaningful anomaly signal under
+            # zscore. For "none"/"l2" qz==q and recon_z==recon (l2 on the unit
+            # sphere), so the z-* figures coincide with the raw ones.
             residual = np.abs(q - recon)
+            z_residual = np.abs(qz - recon_z)
             score = float(np.linalg.norm(q - recon))
-            order = np.argsort(-residual, kind="stable")
+            z_score = float(np.linalg.norm(qz - recon_z))
+            # Rank by the standardized deviation when zscore (cross-field
+            # comparable), otherwise by the raw deviation as before.
+            ranking = z_residual if self.normalize == "zscore" else residual
+            order = np.argsort(-ranking, kind="stable")
             limit = min(max(top_k, 0), self.dimension)
             fields = []
             for idx in order[:limit]:
@@ -463,11 +606,13 @@ class Memory:
                         "value": float(q[idx]),
                         "expected": float(recon[idx]),
                         "deviation": float(residual[idx]),
+                        "z_deviation": float(z_residual[idx]),
                     }
                 )
             nearest = self._contributors(weights, 1)
             return {
                 "score": score,
+                "z_score": z_score,
                 "reconstruction": recon.tolist(),
                 "residual": residual.tolist(),
                 "fields": fields,
@@ -489,6 +634,7 @@ class Memory:
                 dimension=self.dimension,
                 beta=self.beta,
                 fields=list(self.fields) if self.fields else None,
+                normalize=self.normalize,
                 ids=list(self.ids),
                 metadata=[dict(m) for m in self.metadata],
                 matrix=self._X.copy(),
@@ -512,6 +658,10 @@ class Memory:
             manifest["dimension"],
             manifest.get("beta", 8.0),
             manifest.get("fields"),
+            # Legacy files predate this key → "none", preserving exact prior
+            # behaviour. Pass it explicitly so the fields-based default-selection
+            # rule never silently upgrades a loaded raw-vector memory to zscore.
+            manifest.get("normalize", "none"),
         )
         ids = list(manifest["ids"])
         metadata = list(manifest["metadata"])
@@ -549,13 +699,18 @@ class NeuroStore:
 
     # -- memory lifecycle -------------------------------------------------
     def create_memory(
-        self, name: str, dimension: int, beta: float = 8.0, fields: list[str] | None = None
+        self,
+        name: str,
+        dimension: int,
+        beta: float = 8.0,
+        fields: list[str] | None = None,
+        normalize: str | None = None,
     ) -> Memory:
         with self._lock:
             validate_name(name)
             if name in self._memories:
                 raise MemoryError_(f"Memory {name!r} already exists.")
-            mem = Memory(name, dimension, beta, fields)
+            mem = Memory(name, dimension, beta, fields, normalize)
             self._memories[name] = mem
             self.save()
             return mem
@@ -588,7 +743,9 @@ class NeuroStore:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            memories = [mem.info() for mem in self._memories.values()]
+            # Per-memory detail carries the normalize mode and, for zscore, the
+            # per-dimension mean/std (handy for debugging an anomaly flag).
+            memories = [mem.stats() for mem in self._memories.values()]
             return {
                 "memories": len(memories),
                 "patterns": sum(m["count"] for m in memories),

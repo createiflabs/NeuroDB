@@ -73,8 +73,9 @@ python -m neurodb              # serves on http://0.0.0.0:8000
 ### Create a memory
 
 A *memory* is one Hopfield associative memory: a fixed dimension, an inverse
-temperature `beta`, and optional per-dimension `fields` (handy for anomaly
-reports on structured records).
+temperature `beta`, optional per-dimension `fields` (handy for anomaly reports on
+structured records), and a `normalize` mode (see
+[Normalization](#normalization)).
 
 ```bash
 curl -X POST localhost:8000/memories -H 'content-type: application/json' -d '{
@@ -82,6 +83,11 @@ curl -X POST localhost:8000/memories -H 'content-type: application/json' -d '{
   "fields": ["temperature", "humidity", "pressure"]
 }'
 ```
+
+> Because `fields` are given, this memory defaults to `normalize: "zscore"` — each
+> dimension is standardized before recall so a large-magnitude field (here
+> `pressure ~1013`) can't drown out small ones (`temperature ~20`). Pass
+> `"normalize": "none"` to opt out, or `"l2"` for unit-direction embeddings.
 
 ### Write patterns (append vectors)
 
@@ -102,7 +108,7 @@ the rest:
 ```bash
 curl -X POST localhost:8000/memories/sensors/complete -H 'content-type: application/json' \
   -d '{"query": [20, 0, 0], "mask": [0]}'
-# → reconstruction ≈ [20.0, 51.9, 1012.9]
+# → reconstruction ≈ [20.0, 50.25, 1013.0]   (humidity/pressure recalled in raw units)
 ```
 
 ### Per-field anomaly detection
@@ -110,8 +116,14 @@ curl -X POST localhost:8000/memories/sensors/complete -H 'content-type: applicat
 ```bash
 curl -X POST localhost:8000/memories/sensors/anomaly -H 'content-type: application/json' \
   -d '{"query": [20, 95, 1013]}'
-# → score 47.0; top field {"name": "humidity", "value": 95, "expected": 48, "deviation": 47}
+# → score 43.0, z_score 29.1; top field
+#   {"name": "humidity", "value": 95, "expected": 52, "deviation": 43, "z_deviation": 29.1}
 ```
+
+With `zscore`, each field's `z_deviation` is "how many standard deviations off",
+so anomalies are comparable *across* fields (humidity here is ~29σ out); fields
+are ranked by `z_deviation`. The raw `deviation` and `score` are still reported in
+original units for backward compatibility.
 
 ### Similarity search
 
@@ -119,6 +131,36 @@ curl -X POST localhost:8000/memories/sensors/anomaly -H 'content-type: applicati
 curl -X POST localhost:8000/memories/sensors/search -H 'content-type: application/json' \
   -d '{"query": [20, 50, 1013], "k": 3}'
 ```
+
+### Normalization
+
+The Hopfield similarity step is a dot product `X·q`, so without normalization the
+field with the largest numeric magnitude dominates the softmax and smaller fields
+become invisible — an anomaly detector's worst case. Each memory picks one mode at
+creation via `normalize`:
+
+| Mode       | What it does                              | Use when                                                                 |
+| ---------- | ----------------------------------------- | ------------------------------------------------------------------------ |
+| `"zscore"` | per-dimension standardize `(x − μ) / σ`   | **structured records** (sensors, profiles) — fields on disparate scales  |
+| `"l2"`     | per-row L2 normalize to unit length       | text/embedding vectors where direction matters, magnitude doesn't        |
+| `"none"`   | raw dot product (pre-normalization)       | vectors that are already comparably scaled / unit-norm                    |
+
+- **Default:** `"zscore"` when `fields` is given, else `"none"`. Loaded legacy
+  memories (files without the key) default to `"none"`, so existing data behaves
+  exactly as before.
+- `zscore` runs recall in standardized space and **de-normalizes the
+  reconstruction back to raw units**; `anomaly` additionally reports
+  `z_deviation`/`z_score` (deviations measured in σ). `mean`/`std` are recomputed
+  from the matrix on every write — never persisted — and exposed per memory in
+  `/stats` for debugging.
+- `l2` reconstructions live on the unit sphere and are **directional, not in
+  original magnitude units**.
+- `search` always ranks by cosine on the **raw** vectors regardless of mode
+  (cosine already normalizes magnitude away), so search results are unaffected.
+- **Tuning `beta`:** after `zscore`, similarities are on a standardized scale (per
+  field roughly ±a few σ), so a *much* smaller `beta` than for raw records avoids
+  saturating the softmax onto a single row. Start around `beta` 1–4 and raise it
+  for sharper recall.
 
 ### Bring your own embeddings (Python)
 
@@ -234,6 +276,10 @@ NumPy matmul (`O(N·d)`), followed by `x* = Xᵀ·p`:
 - **anomaly** recalls `x*` for the input and reports the per-dimension residual
   `|q − x*|`, naming the worst fields.
 - **search** ranks patterns by cosine similarity.
+
+Per-memory [normalization](#normalization) (`zscore`/`l2`) runs the attention step
+in normalized space and de-normalizes the result, so disparately-scaled fields
+contribute comparably; `search` always ranks on the raw vectors.
 
 The whole store — every memory's matrix, ids and metadata — serialises to a
 single `.npz` file. Each save snapshots every memory under its lock, writes a

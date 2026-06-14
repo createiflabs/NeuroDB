@@ -70,6 +70,27 @@ python -m neurodb              # serves on http://0.0.0.0:8000
 
 ## Walkthrough
 
+### Python client (recommended)
+
+A thin, dependency-free client ships in this repo (`neurodb_client`, stdlib only).
+It's the recommended way to use NeuroDB from Python; the raw HTTP below works from
+any language.
+
+```python
+import neurodb_client as neurodb
+
+db = neurodb.connect("http://localhost:8000", api_key=None)
+mem = db.create("sensors", dimension=3, beta=12,
+                fields=["temperature", "humidity", "pressure"], normalize="zscore")
+mem.write([{"vector": [20, 50, 1013]}, {"vector": [21, 52, 1012]}])
+print(mem.anomaly([20, 95, 1013])["fields"][0])      # → which field is weird, by how many σ
+print(mem.anomaly_batch([[20, 95, 1013], [21, 52, 1012]]))  # batch, one matmul
+print(mem.capacity()["status"])                       # healthy | crowded | saturated
+```
+
+Typed exceptions (`NotFound`, `BadRequest`, `Unauthorized`) map the server's
+error envelope.
+
 ### Create a memory
 
 A *memory* is one Hopfield associative memory: a fixed dimension, an inverse
@@ -125,6 +146,66 @@ so anomalies are comparable *across* fields (humidity here is ~29σ out); fields
 are ranked by `z_deviation`. The raw `deviation` and `score` are still reported in
 original units for backward compatibility.
 
+### Batch recall (anomaly / completion at throughput)
+
+Anomaly detection is a stream/bulk job, so score a whole batch in **one matmul**
+(not one HTTP call per record). Each item may carry an `id` that is echoed back
+so callers can correlate results:
+
+```bash
+curl -X POST localhost:8000/memories/sensors/anomaly/batch -H 'content-type: application/json' \
+  -d '{"items": [{"id": "r1", "vector": [20, 95, 1013]}, {"id": "r2", "vector": [21, 52, 1012]}]}'
+# → {"results": [ {<same shape as /anomaly>, "id": "r1"}, ... ], "count": 2}
+```
+
+`/complete/batch` is the same envelope. A batch result for each item is identical
+to the single-query call; the cap per request is `NEURODB_MAX_BATCH`.
+
+### Filtered recall
+
+`complete` and `anomaly` (and their batch forms) accept the same metadata
+`filter` as `search`, to score a record only against patterns of the same type —
+recall runs over the filtered subset, normalized by the full-memory statistics:
+
+```bash
+curl -X POST localhost:8000/memories/sensors/anomaly -H 'content-type: application/json' \
+  -d '{"query": [20, 95, 1013], "filter": {"site": "warehouse-A"}}'
+```
+
+### Updating records
+
+Records change. `POST .../patterns` with an existing `id` already **upserts** it.
+For partial edits use `PATCH` — `vector` replaces the row, `metadata` shallow-merges
+(or replaces with `merge_metadata: false`):
+
+```bash
+curl -X PATCH localhost:8000/memories/sensors/patterns/r1 -H 'content-type: application/json' \
+  -d '{"metadata": {"label": "checked"}}'
+```
+
+### Capacity / saturation diagnostics
+
+Modern Hopfield memories have finite capacity: past it, distinct patterns'
+attractors merge and recall *silently* returns blends. NeuroDB knows it's a
+Hopfield network and can warn you:
+
+```bash
+curl localhost:8000/memories/sensors/capacity
+# → {"status": "healthy|crowded|saturated", "self_recall_fail_fraction": ...,
+#    "max_pairwise_similarity": ..., "suggested_beta": ..., ...}
+```
+
+`self_recall_fail_fraction` is the honest signal — the fraction of sampled
+patterns that can't even retrieve *themselves* at the memory's β. A compact
+version appears per memory in `/stats`, and `/health` reports a
+`saturated_memories` count.
+
+> **Worked benchmark:** [`examples/anomaly_benchmark/`](examples/anomaly_benchmark/)
+> runs per-field anomaly attribution on a realistic multi-scale dataset and
+> compares detection quality with scikit-learn's IsolationForest — matching its
+> ROC-AUC (~0.93) with **zero training** while naming the offending field and its
+> σ deviation.
+
 ### Similarity search
 
 ```bash
@@ -162,7 +243,10 @@ creation via `normalize`:
   saturating the softmax onto a single row. Start around `beta` 1–4 and raise it
   for sharper recall.
 
-### Bring your own embeddings (Python)
+### Bring your own embeddings (raw HTTP)
+
+The `neurodb_client` above removes this boilerplate, but here's the dependency-free
+HTTP path (works from any language) with your own embedding model:
 
 ```python
 import urllib.request, json
@@ -214,12 +298,16 @@ curl -X POST localhost:8000/memories/demo/recall/text -H 'content-type: applicat
 | `POST`   | `/memories`                           | Create a memory                            |
 | `GET`    | `/memories` · `/memories/{n}`         | List / inspect memories                    |
 | `DELETE` | `/memories/{n}`                       | Delete a memory                            |
-| `POST`   | `/memories/{n}/patterns`              | Append patterns                            |
+| `POST`   | `/memories/{n}/patterns`              | Append patterns (existing id upserts)      |
 | `GET`    | `/memories/{n}/patterns/{id}`         | Fetch a pattern                            |
+| `PATCH`  | `/memories/{n}/patterns/{id}`         | Update a pattern (vector / metadata)       |
 | `DELETE` | `/memories/{n}/patterns/{id}`         | Delete a pattern                           |
 | `POST`   | `/memories/{n}/complete`              | Recall / pattern completion                |
+| `POST`   | `/memories/{n}/complete/batch`        | Batch completion (one matmul)              |
 | `POST`   | `/memories/{n}/search`                | Nearest patterns (cosine)                  |
 | `POST`   | `/memories/{n}/anomaly`               | Per-field anomaly detection                |
+| `POST`   | `/memories/{n}/anomaly/batch`         | Batch anomaly detection (one matmul)       |
+| `GET`    | `/memories/{n}/capacity`              | Hopfield capacity / saturation report      |
 | `POST`   | `/memories/{n}/texts`                 | Append text (built-in embedder)            |
 | `POST`   | `/memories/{n}/search/text`           | Text similarity search                     |
 | `POST`   | `/memories/{n}/recall/text`           | Text recall (attention distribution)       |
@@ -237,6 +325,7 @@ All settings are environment variables:
 | `NEURODB_HOST`               | `0.0.0.0`             | Bind address.                                                      |
 | `NEURODB_PORT`               | `8000`                | Bind port.                                                         |
 | `NEURODB_AUTOSAVE_INTERVAL`  | `5`                   | Seconds between autosaves when dirty.                              |
+| `NEURODB_MAX_BATCH`          | `1024`                | Max items in one `/anomaly/batch` or `/complete/batch` request.    |
 | `NEURODB_API_KEY`            | _(unset)_             | Required on data routes when set (see auth below).                 |
 | `NEURODB_ALLOW_ANONYMOUS`    | `false`               | Allow running without a key. **Required** if `NEURODB_API_KEY` is unset, otherwise the server refuses to start. |
 | `NEURODB_CORS_ORIGINS`       | _(empty)_             | Comma-separated allowed CORS origins. Empty = no cross-origin.     |
@@ -280,6 +369,12 @@ NumPy matmul (`O(N·d)`), followed by `x* = Xᵀ·p`:
 Per-memory [normalization](#normalization) (`zscore`/`l2`) runs the attention step
 in normalized space and de-normalizes the result, so disparately-scaled fields
 contribute comparably; `search` always ranks on the raw vectors.
+
+The batch endpoints run the same step over an `(M, D)` query block as a single
+matmul (`softmax(β·Q·Xᵀ)` → `weights·X`), so scoring a stream of records is
+vectorized, not a Python loop. `capacity` reports the network's saturation
+(self-recall failure fraction) — the Hopfield-specific signal that recall is
+degrading into blends, which a plain vector store can't tell you.
 
 The whole store — every memory's matrix, ids and metadata — serialises to a
 single `.npz` file. Each save snapshots every memory under its lock, writes a

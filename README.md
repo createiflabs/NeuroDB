@@ -467,6 +467,42 @@ store starts empty, unless `NEURODB_FAIL_ON_CORRUPT_LOAD=1`.
 
 ---
 
+## Performance & limits
+
+Recall is an exact full scan — every query is an `O(N·D)` matmul — so latency
+grows **linearly with the number of patterns**. Representative single-node numbers
+(commodity laptop CPU; run `python examples/benchmark_perf/run.py` for your own):
+
+| N patterns | D dims | single `anomaly` | `anomaly_batch` (M=256) | memory |
+|-----------:|-------:|-----------------:|------------------------:|-------:|
+| 1,000      | 32     | ~0.1 ms          | ~5 ms                   | ~0.25 MiB |
+| 10,000     | 64     | ~0.3 ms          | ~28 ms                  | ~5 MiB |
+| 50,000     | 128    | ~3 ms            | ~0.5 s                  | ~49 MiB |
+| 100,000    | 256    | ~8 ms            | ~1.0 s                  | ~195 MiB |
+
+Single-record anomaly stays sub-10 ms into the 100k range; batch latency and
+memory scale with N. A `zscore`/`l2` memory keeps a cached normalized matrix, so
+it costs roughly **2× raw** (`N·D·4` bytes). Past a few hundred thousand patterns
+per memory on one node, shard the population across memories or reach for a
+purpose-built ANN index — NeuroDB is built for exact recall and per-field
+attribution at single-node scale.
+
+Set resource ceilings so a runaway writer is rejected (HTTP `413`) instead of
+OOM-crashing the process — reads keep serving:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `NEURODB_MAX_PATTERNS_PER_MEMORY` | `1000000` | reject writes past this count (`0`=unlimited) |
+| `NEURODB_MAX_TOTAL_BYTES` | unset | reject writes past this estimated footprint |
+| `NEURODB_MEMORY_PRESSURE_PCT` | `90` | `/health` flips `memory_pressure` at this % of budget |
+
+`/v1/stats` reports `approx_bytes` and `pct_of_budget`. For backup/restore,
+upgrades, the slowlog, and the API-stability promise, see
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) and
+[`docs/API_STABILITY.md`](docs/API_STABILITY.md).
+
+---
+
 ## Development
 
 ```bash

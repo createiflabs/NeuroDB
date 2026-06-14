@@ -48,7 +48,11 @@ DESCRIPTION = (
     "NeuroDB is a content-addressable store powered by **Modern Hopfield "
     "networks**. Writing a pattern is appending a vector; retrieval is a single "
     "attention step. It offers pattern completion, per-field anomaly detection "
-    "and similarity search, with single-file persistence."
+    "and similarity search, with single-file persistence.\n\n"
+    "**API stability:** the `/v1` surface is stable — breaking changes ship under "
+    "a new `/v2` prefix. The unversioned legacy aliases are deprecated (they emit "
+    "a `Deprecation` header) and will be removed in a future major release. See "
+    "`docs/API_STABILITY.md`."
 )
 
 

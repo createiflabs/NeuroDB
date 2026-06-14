@@ -17,19 +17,58 @@ writes since the last of the above events.
 
 ## Backup & restore
 
-The data file is a single atomically-replaced `.npz`, so copying it while the
-process is running yields a consistent snapshot.
+Use the built-in tooling — it takes the snapshot under the store lock (so matrix
+rows always agree with ids/metadata) and validates a source before it ever
+replaces live data.
 
 ```bash
-# Backup (safe at any time; the rename is atomic)
-cp /data/neurodb.npz /backups/neurodb-$(date +%F).npz
+# Backup (consistent point-in-time snapshot; dest may be a file or directory)
+neurodb backup /backups/                       # → /backups/neurodb-backup-<ts>.npz
+# or over HTTP (admin: same API key as the data API)
+curl -s -X POST -H "X-API-Key: $KEY" localhost:8000/v1/backup
+curl -s -X POST -H "X-API-Key: $KEY" "localhost:8000/v1/backup?download=true" -o snap.npz
 
-# Restore
+# Restore (validates the source first; preserves the current file as *.pre-restore)
 docker compose stop
-cp /backups/neurodb-2026-06-13.npz /data/neurodb.npz
+neurodb restore /backups/neurodb-backup-<ts>.npz
 docker compose start
 curl -s localhost:8000/ready && curl -s -H "X-API-Key: $KEY" localhost:8000/v1/stats
 ```
+
+Remote/off-box targets are deliberately your call — ship the snapshot with your
+own tool (no cloud SDKs in core):
+
+```bash
+# Cron sidecar: snapshot every 15 min and push wherever you like.
+*/15 * * * * neurodb backup /backups/ && aws s3 cp --recursive /backups s3://my-bucket/neurodb/
+```
+
+Restore is CLI-only (too dangerous to expose over HTTP). A corrupt or
+newer-format source is refused **before** the live file is touched.
+
+## Upgrades & data migration
+
+The data file carries a manifest `version`. On startup an older file is migrated
+forward in memory automatically and the upgraded version is stamped on the next
+save; a file written by a *newer* NeuroDB is refused with an upgrade message
+(restore an older backup or upgrade the binary). To migrate eagerly:
+
+```bash
+neurodb migrate        # loads, migrates, and rewrites at the current version
+```
+
+## Resource limits
+
+To stop a runaway writer OOM-killing the process, set ceilings — writes past
+them are rejected with `413` **before** allocating, while reads keep serving:
+
+- `NEURODB_MAX_PATTERNS_PER_MEMORY` (default 1,000,000; `0` = unlimited)
+- `NEURODB_MAX_TOTAL_BYTES` (default unset/unlimited) — estimated total footprint
+- `NEURODB_MEMORY_PRESSURE_PCT` (default 90) — `/health` flips `memory_pressure`
+
+`/v1/stats` reports `approx_bytes` and `pct_of_budget` per memory and in
+aggregate. Note `zscore`/`l2` memories cost roughly **double** (raw matrix plus a
+cached normalized matrix), and that cache counts against the byte budget.
 
 ## Corrupt-file recovery
 
@@ -45,7 +84,15 @@ Scrape `/metrics`. Useful signals:
 
 - `neurodb_save_total{result="error"}` increasing — persistence is failing
   (disk full / permissions); `/ready` will also flip to 503.
-- `neurodb_http_request_duration_seconds` — latency.
+- `neurodb_http_request_duration_seconds` — per-route latency.
+- `neurodb_batch_size` — batch-request size distribution (spot misuse / tune
+  `NEURODB_MAX_BATCH`).
+- `neurodb_ops_total{op="write|update|delete"}` — mutation rate.
 - `neurodb_patterns_total` / `neurodb_memories` — store growth.
 
-Alert on `/ready` returning 503 and on any `save_total{result="error"}`.
+For "why is this one request slow", inspect the **slowlog**: any data op slower
+than `NEURODB_SLOWLOG_MS` (default 200ms) is recorded (timing + shape only, never
+contents) and the recent ring buffer is at `GET /v1/slowlog` (admin-guarded).
+
+Alert on `/ready` returning 503, on any `save_total{result="error"}`, and on
+`/health` reporting `memory_pressure: true`.

@@ -77,7 +77,7 @@ It's the recommended way to use NeuroDB from Python; the raw HTTP below works fr
 any language.
 
 ```python
-import neurodb_client as neurodb
+import neurodb_client as neurodb   # or: from neurodb import connect, ValidationReport
 
 db = neurodb.connect("http://localhost:8000", api_key=None)
 mem = db.create("sensors", dimension=3, beta=12,
@@ -160,6 +160,81 @@ curl -X POST localhost:8000/memories/sensors/anomaly/batch -H 'content-type: app
 
 `/complete/batch` is the same envelope. A batch result for each item is identical
 to the single-query call; the cap per request is `NEURODB_MAX_BATCH`.
+
+### Dataset validation
+
+Per-field anomaly scoring composes into a one-call **dataset check**:
+`Memory.validate(records, threshold=...)` streams records through the batch
+anomaly endpoint, flags any field whose `z_deviation` exceeds `threshold`, and
+returns a `ValidationReport` — plain data that drops straight into a data
+pipeline.
+
+```python
+from neurodb import connect
+
+db = connect("http://localhost:8000")
+mem = db.memory("sensors")
+
+report = mem.validate(
+    [{"id": "r1", "vector": [20, 95, 1013]}, {"id": "r2", "vector": [21, 52, 1012]}],
+    threshold=3.0,            # σ; defaults to 3.0
+    fields=None,              # optionally restrict to a subset of field names
+)
+print(report.summary())       # NeuroDB validation [sensors]: 1/2 passed (50.0%), 1 failed, threshold=3.0
+print(report.ok)              # False  (also: bool(report))
+report.to_dict()              # JSON-friendly: records, per-field stats, pass_rate
+```
+
+It is pure client-side composition over `/anomaly/batch` — no extra server
+endpoint. Each run emits one local telemetry event; see **Telemetry** below.
+
+### Integrations
+
+Optional adapters wrap `validate(...)` for common data-stack tools. They live in
+`neurodb_client.integrations` and are guarded behind extras — install only what
+you use:
+
+```bash
+pip install 'neurodb[great-expectations]'   # or [airflow], [dagster], [integrations]
+```
+
+```python
+# Great Expectations — a callable returning a GE-style {success, result}
+from neurodb_client.integrations.great_expectations import neurodb_expectation
+check = neurodb_expectation(mem, threshold=3.0)
+check(records)
+
+# Airflow — fails the task when records fail validation
+from neurodb_client.integrations.airflow import NeuroDBValidateOperator
+NeuroDBValidateOperator(task_id="validate", memory=mem, records=records)
+
+# Dagster — an asset check on the upstream asset
+from neurodb_client.integrations.dagster import neurodb_asset_check
+neurodb_asset_check(asset=my_asset, memory=mem, records=records)
+```
+
+Each adapter raises a clear `ImportError` (naming the extra) if its library
+isn't installed, so importing the subpackage never drags the heavy deps in.
+
+### Telemetry
+
+Validation runs emit a small `TelemetryEvent` (counts + pass rate, no payloads).
+The default sink is a **no-op** — nothing is collected and nothing leaves the
+machine. NeuroDB ships no remote endpoint; forwarding is a seam you opt into:
+
+```python
+from neurodb_client import telemetry
+
+agg = telemetry.LocalAggregator()       # in-process counters
+telemetry.set_sink(agg)
+...                                      # run validations
+print(agg.snapshot())                   # {"runs": 3, "records": 900, "failures": 12, ...}
+
+# To ship elsewhere, implement emit() and register it:
+class MySink:
+    def emit(self, event): requests.post(MY_URL, json=event.to_dict())
+telemetry.set_sink(MySink())
+```
 
 ### Filtered recall
 

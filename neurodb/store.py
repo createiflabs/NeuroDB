@@ -188,9 +188,10 @@ class MemorySnapshot:
     metadata: list[dict[str, Any]]
     matrix: np.ndarray
     version: int
+    collection: dict[str, Any] | None = None
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        manifest = {
             "name": self.name,
             "dimension": self.dimension,
             "beta": self.beta,
@@ -202,6 +203,12 @@ class MemorySnapshot:
             "ids": self.ids,
             "metadata": self.metadata,
         }
+        # Additive, optional: provenance/attestation/signature of a memory loaded
+        # from a collection bundle, so it survives save/reload (legacy files omit
+        # it and load as a plain memory).
+        if self.collection is not None:
+            manifest["collection"] = self.collection
+        return manifest
 
 
 class Memory:
@@ -1016,6 +1023,13 @@ class Memory:
             "self_recall_fail_fraction": full["self_recall_fail_fraction"],
         }
 
+    def capacity_status_cached(self) -> str | None:
+        """Capacity status if already computed, else None — never triggers the
+        (potentially heavy) recompute. For the liveness path (/health)."""
+
+        with self._lock:
+            return self._capacity["status"] if self._capacity else None
+
     # -- (de)serialisation for single-file persistence -------------------
     def snapshot(self) -> MemorySnapshot:
         """An immutable, consistent copy for persistence (taken under the lock).
@@ -1035,6 +1049,7 @@ class Memory:
                 metadata=[dict(m) for m in self.metadata],
                 matrix=self._X.copy(),
                 version=self._version,
+                collection=self.collection,
             )
 
     def mark_saved(self, version: int) -> None:
@@ -1077,6 +1092,9 @@ class Memory:
         mem.metadata = metadata
         mem._index = {i: j for j, i in enumerate(mem.ids)}
         mem._X = matrix.astype(np.float32, copy=False)
+        # Restore collection provenance/attestation if this memory was loaded
+        # from a bundle (additive key; absent on plain/legacy memories).
+        mem.collection = manifest.get("collection")
         # Loaded state mirrors disk, so it starts clean (version 0 == saved 0).
         return mem
 
@@ -1169,6 +1187,8 @@ class NeuroStore:
                 fields,
                 manifest.get("normalize"),
             )
+            # A bundle is an external write source — enforce the same ceilings.
+            self.check_write(coll_name, len(patterns), mem.dimension, mem.normalize)
             mem.write([{"vector": row.tolist()} for row in patterns])
             mem.collection = {
                 "criteria": manifest.get("criteria"),
@@ -1252,6 +1272,45 @@ class NeuroStore:
                         f"NEURODB_MAX_TOTAL_BYTES ({self.max_total_bytes}): "
                         f"~{total} current + ~{added} new bytes."
                     )
+
+    def write(self, name: str, items: list[dict[str, Any]]) -> list[str]:
+        """Append patterns with the resource-ceiling check applied atomically.
+
+        Holding the store lock across both the check and the append closes the
+        TOCTOU window (two concurrent writes can't both pass the same ceiling)
+        and makes the limit unbypassable — every external write path goes through
+        here, not straight to ``Memory.write``.
+        """
+
+        with self._lock:
+            mem = self.get_memory(name)
+            self.check_write(name, len(items), mem.dimension, mem.normalize)
+            return mem.write(items)
+
+    def health_summary(self) -> dict[str, Any]:
+        """Cheap liveness + footprint summary for /health.
+
+        Deliberately avoids the per-memory capacity diagnostic (matmuls,
+        recomputed after every write) that /stats runs — ``saturated_memories``
+        counts only memories whose capacity is *already* cached, so a liveness
+        probe never triggers heavy compute.
+        """
+
+        with self._lock:
+            mems = list(self._memories.values())
+            total_bytes = sum(m.approx_bytes for m in mems)
+            budget = self.max_total_bytes
+            return {
+                "memories": len(mems),
+                "patterns": sum(m.count for m in mems),
+                "approx_bytes": total_bytes,
+                "saturated_memories": sum(
+                    1 for m in mems if m.capacity_status_cached() == "saturated"
+                ),
+                "pct_of_budget": (
+                    round(100.0 * total_bytes / budget, 2) if budget > 0 else None
+                ),
+            }
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

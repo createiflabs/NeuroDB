@@ -85,9 +85,29 @@ def restore_file(src: str | Path, data_file: str | Path) -> Path | None:
         logger.info("preserved current data file to %s", preserved)
 
     # Stage into the destination dir then atomically replace, so an interrupted
-    # restore cannot leave a half-written live file.
+    # restore cannot leave a half-written live file. Match the store's save
+    # durability: fsync the staged file and the directory around the rename.
     tmp = data_file.with_suffix(data_file.suffix + ".restore-tmp")
     shutil.copy2(src, tmp)
+    with open(tmp, "rb") as handle:
+        os.fsync(handle.fileno())
     os.replace(tmp, data_file)
+    _fsync_dir(data_file.parent)
     logger.info("restored %s from %s", data_file, src)
     return preserved
+
+
+def _fsync_dir(directory: Path) -> None:
+    """fsync a directory so a rename within it is durable (POSIX; no-op on
+    Windows, which has no directory fsync)."""
+
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        logger.warning("could not fsync directory %s", directory)

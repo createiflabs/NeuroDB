@@ -334,24 +334,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health", tags=["system"])
     async def health():
-        # Liveness + lightweight counts (used by the dashboard).
-        stats = await run_in_threadpool(store.stats)
-        # Aggregate Hopfield saturation flag: count (don't name) memories whose
-        # recall is over capacity for their beta, so it's operationally visible.
-        saturated = sum(
-            1 for m in stats["detail"] if m.get("capacity", {}).get("status") == "saturated"
-        )
-        # Memory-pressure flag: over the configured % of the byte budget. Only
-        # meaningful when a budget is set; False otherwise.
-        pct = stats.get("pct_of_budget")
+        # Liveness: cheap counts + footprint only — no capacity diagnostic, so a
+        # frequently-polled probe never triggers per-memory recompute (use /stats
+        # for the full capacity detail). saturated_memories is best-effort from
+        # already-cached capacity.
+        summary = await run_in_threadpool(store.health_summary)
+        pct = summary.get("pct_of_budget")
         memory_pressure = pct is not None and pct >= settings.memory_pressure_pct
         return {
             "status": "ok",
             "version": __version__,
-            "memories": stats["memories"],
-            "patterns": stats["patterns"],
-            "saturated_memories": saturated,
-            "approx_bytes": stats["approx_bytes"],
+            "memories": summary["memories"],
+            "patterns": summary["patterns"],
+            "saturated_memories": summary["saturated_memories"],
+            "approx_bytes": summary["approx_bytes"],
             "memory_pressure": memory_pressure,
         }
 
@@ -472,12 +468,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # -- patterns (writing is appending a vector) ------------------------
     @api.post("/memories/{name}/patterns", tags=["patterns"])
     async def write_patterns(name: str, body: WriteRequest, request: Request):
-        mem = store.get_memory(name)
-        store.check_write(name, len(body.items), mem.dimension, mem.normalize)
         items = [item.model_dump() for item in body.items]
-        affected = await run_in_threadpool(mem.write, items)
+        # store.write applies the resource-ceiling check atomically with the
+        # append (no TOCTOU, no bypass).
+        affected = await run_in_threadpool(store.write, name, items)
         metrics.record_op("write")
-        request.state.pattern_count = mem.count
+        request.state.pattern_count = store.get_memory(name).count
         return {"written": len(affected), "ids": affected}
 
     @api.get("/memories/{name}/patterns/{pattern_id}", tags=["patterns"])
@@ -578,7 +574,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def write_texts(name: str, body: TextWriteRequest):
         mem = store.get_memory(name)
         _ensure_text_dim(mem)
-        store.check_write(name, len(body.items), mem.dimension, mem.normalize)
         items = []
         for item in body.items:
             meta = dict(item.metadata)
@@ -590,7 +585,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "metadata": meta,
                 }
             )
-        affected = await run_in_threadpool(mem.write, items)
+        affected = await run_in_threadpool(store.write, name, items)
         return {"written": len(affected), "ids": affected}
 
     @api.post("/memories/{name}/search/text", tags=["text"])

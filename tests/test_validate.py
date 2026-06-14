@@ -82,6 +82,25 @@ def test_batching_covers_all_records(sensors):
     assert report.total == len(NORMAL)
 
 
+def test_validate_scores_all_fields_not_just_top5(db):
+    # A memory with more than 5 fields: every field must be scored, not just the
+    # anomaly endpoint's default top-5 by deviation (else field_stats undercounts
+    # and a fields= filter can miss a breach).
+    names = [f"f{i}" for i in range(8)]
+    mem = db.create("wide", dimension=8, beta=16.0, fields=names, normalize="zscore")
+    rows = [[i % 3, i % 5, i % 2, i % 7, i % 4, i % 6, i % 3, i % 5] for i in range(10)]
+    mem.write([{"vector": r} for r in rows])
+
+    report = mem.validate(rows, threshold=3.0)
+    assert set(report.field_stats) == set(names)  # all 8, not capped at 5
+
+    # A fields= filter targets a specific field's breach even if other fields
+    # deviate more on that record.
+    outlier = [0, 0, 0, 0, 0, 0, 0, 99]
+    r = mem.validate([outlier], threshold=3.0, fields=["f7"])
+    assert not r.ok
+
+
 def test_report_serialization(sensors):
     report = sensors.validate(NORMAL, threshold=3.0)
     d = report.to_dict()

@@ -27,7 +27,7 @@ from neurodb.collections.bundle import (
 from neurodb.collections.license import SignatureOnlyLicense, set_license
 from neurodb.config import Settings
 from neurodb.server import create_app
-from neurodb.store import NeuroStore
+from neurodb.store import LimitExceededError, NeuroStore
 
 PATTERNS = np.array([[20.0, 50.0, 1013.0], [21.0, 52.0, 1012.0], [19.0, 48.0, 1014.0],
                      [20.0, 51.0, 1013.0], [21.0, 49.0, 1012.0]], dtype=np.float32)
@@ -201,6 +201,68 @@ def test_manifest_migration_identity_and_gap(tmp_path):
     # A gap with no registered migration fails loudly.
     with pytest.raises(BundleError):
         bundle_mod.migrate_manifest({"format_version": 999}, target=1000)
+
+
+# -- regression: review fixes -------------------------------------------------
+def test_collection_metadata_survives_reload(tmp_path):
+    bundle = _build(tmp_path / "c.ndcoll")
+    store = NeuroStore(tmp_path / "db.npz")
+    store.load_collection(bundle)  # persists via save()
+
+    reloaded = NeuroStore(tmp_path / "db.npz")
+    mem = reloaded.get_memory("sensors")
+    assert mem.collection is not None
+    assert mem.collection["provenance"]["source"] == "synthetic"
+    assert mem.collection["criteria"]["set"] == "TEST-Katalog"
+
+
+def test_newer_format_version_rejected(tmp_path):
+    bundle = _build(tmp_path / "c.ndcoll")
+    with zipfile.ZipFile(bundle) as zf:
+        members = {n: zf.read(n) for n in zf.namelist()}
+    manifest = json.loads(members["collection.json"])
+    manifest["format_version"] = 999
+    newer = tmp_path / "newer.ndcoll"
+    with zipfile.ZipFile(newer, "w") as zf:
+        zf.writestr("collection.json", json.dumps(manifest))
+        zf.writestr("patterns.npy", members["patterns.npy"])
+    with pytest.raises(BundleError, match="newer"):
+        read_manifest(newer)
+
+
+def test_verify_signed_bundle_missing_member_is_invalid_not_crash(tmp_path):
+    sk, _ = signing.generate_keypair()
+    bundle = _build(tmp_path / "c.ndcoll", sign_key=sk)
+    with zipfile.ZipFile(bundle) as zf:
+        members = {n: zf.read(n) for n in zf.namelist()}
+    broken = tmp_path / "broken.ndcoll"
+    with zipfile.ZipFile(broken, "w") as zf:
+        zf.writestr("collection.json", members["collection.json"])
+        zf.writestr("signature.json", members["signature.json"])  # patterns.npy omitted
+    result = verify_bundle(broken)  # must not raise
+    assert result.signed is True and result.valid is False
+
+
+def test_info_on_incomplete_manifest_raises_bundle_error(tmp_path):
+    path = tmp_path / "nobaseline.ndcoll"
+    manifest = {  # well-formed except missing baseline + provenance
+        "format_version": 1, "name": "x", "dimension": 3,
+        "schema": SCHEMA.to_dict(), "criteria": CRITERIA,
+    }
+    buf = io.BytesIO()
+    np.save(buf, PATTERNS)
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("collection.json", json.dumps(manifest))
+        zf.writestr("patterns.npy", buf.getvalue())
+    with pytest.raises(BundleError):
+        info(path)
+
+
+def test_load_collection_respects_pattern_ceiling(tmp_path):
+    bundle = _build(tmp_path / "c.ndcoll")  # 5 patterns
+    store = NeuroStore(tmp_path / "db.npz", max_patterns_per_memory=3)
+    with pytest.raises(LimitExceededError):
+        store.load_collection(bundle)
 
 
 # -- HTTP surface -------------------------------------------------------------

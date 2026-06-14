@@ -43,6 +43,12 @@ _SIGNATURE_ENTRY = "signature.json"
 
 _VALID_SOURCES = ("synthetic", "anonymized", "mixed")
 
+# Blocks a well-formed manifest must carry (so info()/load fail with a clear
+# BundleError rather than a KeyError on a structurally-incomplete bundle).
+_REQUIRED_MANIFEST_KEYS = (
+    "format_version", "name", "dimension", "schema", "baseline", "criteria", "provenance",
+)
+
 
 class BundleError(Exception):
     """A bundle is malformed, unverifiable, or fails a required-block check."""
@@ -150,16 +156,19 @@ def compute_baseline(
     they can see the collection is healthy (not saturated)."""
 
     # Local import avoids a module import cycle (store imports collections indirectly).
-    from ..store import Memory
+    from ..store import _NORM_EPS, Memory
 
     mem = Memory("baseline", patterns.shape[1], beta, fields, normalize)
     mem.write([{"vector": row.tolist()} for row in patterns])
     names = fields or [f"field_{i}" for i in range(patterns.shape[1])]
     if thresholds is None:
         thresholds = {name: 3.0 for name in names}
+    # Floor std with the engine's _NORM_EPS so the published baseline matches how
+    # the loaded memory actually normalizes (a constant column → eps, not 0.0).
+    std = np.maximum(np.std(patterns, axis=0), _NORM_EPS)
     return {
         "mean": np.mean(patterns, axis=0).astype(float).tolist(),
-        "std": np.std(patterns, axis=0).astype(float).tolist(),
+        "std": std.astype(float).tolist(),
         "recommended_beta": float(beta),
         "thresholds": thresholds,
         "capacity": mem.capacity_compact(),
@@ -254,13 +263,24 @@ def build_bundle(
 
 
 def read_manifest(path: str | Path) -> dict[str, Any]:
-    """Read and migrate the manifest **without** materializing the patterns."""
+    """Read, version-check, migrate, and structurally validate the manifest
+    **without** materializing the patterns."""
 
     with zipfile.ZipFile(path) as zf:
         if _COLLECTION_ENTRY not in zf.namelist():
             raise BundleError(f"bundle is missing {_COLLECTION_ENTRY}")
         manifest = json.loads(zf.read(_COLLECTION_ENTRY))
-    return migrate_manifest(manifest, target=_BUNDLE_FORMAT_VERSION)
+    version = int(manifest.get("format_version", 0))
+    if version > _BUNDLE_FORMAT_VERSION:
+        raise BundleError(
+            f"bundle was written by a newer NeuroDB (format v{version}); this "
+            f"build supports up to v{_BUNDLE_FORMAT_VERSION}. Upgrade NeuroDB."
+        )
+    manifest = migrate_manifest(manifest, target=_BUNDLE_FORMAT_VERSION)
+    missing = [k for k in _REQUIRED_MANIFEST_KEYS if k not in manifest]
+    if missing:
+        raise BundleError(f"bundle manifest is missing required blocks: {missing}")
+    return manifest
 
 
 def read_patterns(path: str | Path) -> np.ndarray:
@@ -300,6 +320,10 @@ def verify_bundle(
         names = zf.namelist()
         if _SIGNATURE_ENTRY not in names:
             return VerificationResult(signed=False, valid=True, public_key=None, trusted=False)
+        # A signed bundle missing a signed member can't verify — report invalid
+        # rather than crashing with a KeyError on the read below.
+        if _COLLECTION_ENTRY not in names or _PATTERNS_ENTRY not in names:
+            return VerificationResult(signed=True, valid=False, public_key=None, trusted=False)
         collection_bytes = zf.read(_COLLECTION_ENTRY)
         patterns_bytes = zf.read(_PATTERNS_ENTRY)
         sig_info = json.loads(zf.read(_SIGNATURE_ENTRY))

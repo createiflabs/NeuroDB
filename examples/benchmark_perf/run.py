@@ -47,9 +47,9 @@ class _LocalMemory:
         self._mem = mem
         self.name = mem.name
 
-    def anomaly_batch(self, items, *, beta=None, filter=None):
+    def anomaly_batch(self, items, *, beta=None, top_k=5, filter=None):
         vectors = [it["vector"] for it in items]
-        results = self._mem.anomaly_batch(vectors, beta, 5, filter)
+        results = self._mem.anomaly_batch(vectors, beta, top_k, filter)
         return {"results": results, "count": len(results)}
 
 

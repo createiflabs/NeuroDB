@@ -116,6 +116,14 @@ def run_validation(
     items = _as_items(records)
     only = set(fields) if fields is not None else None
 
+    # Score *every* field, not just the anomaly endpoint's default top-5 by
+    # deviation: otherwise field_stats undercounts and a `fields=` filter can
+    # silently miss a breach that ranks below five larger (in-tolerance)
+    # deviations. (The server caps top_k at 1000; collections with more fields
+    # than that are not the structured-record target of validate.)
+    dim = (getattr(memory, "info", None) or {}).get("dimension")
+    top_k = min(dim or 1000, 1000)
+
     record_results: list[RecordResult] = []
     stats: dict[str, dict[str, float]] = {}
 
@@ -123,7 +131,7 @@ def run_validation(
         chunk = items[start : start + max(1, batch_size)]
         if not chunk:
             continue
-        resp = memory.anomaly_batch(chunk, beta=beta, filter=filter)
+        resp = memory.anomaly_batch(chunk, beta=beta, top_k=top_k, filter=filter)
         for result in resp.get("results", []):
             record_results.append(
                 _score_record(result, threshold, only, stats)

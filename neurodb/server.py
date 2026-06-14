@@ -25,10 +25,13 @@ from . import __version__
 from .config import Settings, get_settings
 from .embedding import embed_text
 from .models import (
+    AnomalyBatchRequest,
     AnomalyRequest,
+    CompleteBatchRequest,
     CompleteRequest,
     CreateMemoryRequest,
     EmbedRequest,
+    PatternUpdate,
     SearchRequest,
     TextSearchRequest,
     TextWriteRequest,
@@ -288,12 +291,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health", tags=["system"])
     async def health():
         # Liveness + lightweight counts (used by the dashboard).
-        stats = store.stats()
+        stats = await run_in_threadpool(store.stats)
+        # Aggregate Hopfield saturation flag: count (don't name) memories whose
+        # recall is over capacity for their beta, so it's operationally visible.
+        saturated = sum(
+            1 for m in stats["detail"] if m.get("capacity", {}).get("status") == "saturated"
+        )
         return {
             "status": "ok",
             "version": __version__,
             "memories": stats["memories"],
             "patterns": stats["patterns"],
+            "saturated_memories": saturated,
         }
 
     @app.get("/ready", tags=["system"])
@@ -305,8 +314,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics_endpoint():
-        stats = store.stats()
-        body = metrics.render(stats["memories"], stats["patterns"])
+        n_memories, n_patterns = store.counts()  # cheap; skip capacity diagnostic
+        body = metrics.render(n_memories, n_patterns)
         return Response(content=body, media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/version", tags=["system"])
@@ -373,6 +382,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_pattern(name: str, pattern_id: str):
         return store.get_memory(name).get(pattern_id)
 
+    @api.patch("/memories/{name}/patterns/{pattern_id}", tags=["patterns"])
+    async def update_pattern(name: str, pattern_id: str, body: PatternUpdate):
+        mem = store.get_memory(name)
+        return await run_in_threadpool(
+            mem.update, pattern_id, body.vector, body.metadata, body.merge_metadata
+        )
+
     @api.delete("/memories/{name}/patterns/{pattern_id}", tags=["patterns"])
     async def delete_pattern(name: str, pattern_id: str):
         mem = store.get_memory(name)
@@ -381,13 +397,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise NotFoundError(f"Pattern {pattern_id!r} not found in memory {name!r}.")
         return {"deleted": pattern_id}
 
+    def _check_batch_size(items: list) -> None:
+        if len(items) > settings.max_batch:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Batch too large: {len(items)} items (max {settings.max_batch}).",
+            )
+
     # -- content-addressable operations ----------------------------------
     @api.post("/memories/{name}/complete", tags=["recall"])
     async def complete(name: str, body: CompleteRequest):
         mem = store.get_memory(name)
         return await run_in_threadpool(
-            mem.complete, body.query, body.beta, body.mask, body.steps, body.top_k
+            mem.complete, body.query, body.beta, body.mask, body.steps, body.top_k, body.filter
         )
+
+    @api.post("/memories/{name}/complete/batch", tags=["recall"])
+    async def complete_batch(name: str, body: CompleteBatchRequest):
+        mem = store.get_memory(name)
+        _check_batch_size(body.items)
+        vectors = [it.vector for it in body.items]
+        results = await run_in_threadpool(
+            mem.complete_batch, vectors, body.beta, body.mask, body.steps, body.top_k, body.filter
+        )
+        for it, res in zip(body.items, results, strict=True):
+            res["id"] = it.id
+        return {"results": results, "count": len(results)}
 
     @api.post("/memories/{name}/search", tags=["recall"])
     async def search(name: str, body: SearchRequest):
@@ -400,7 +435,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @api.post("/memories/{name}/anomaly", tags=["recall"])
     async def anomaly(name: str, body: AnomalyRequest):
         mem = store.get_memory(name)
-        return await run_in_threadpool(mem.anomaly, body.query, body.beta, body.top_k)
+        return await run_in_threadpool(
+            mem.anomaly, body.query, body.beta, body.top_k, body.filter
+        )
+
+    @api.post("/memories/{name}/anomaly/batch", tags=["recall"])
+    async def anomaly_batch(name: str, body: AnomalyBatchRequest):
+        mem = store.get_memory(name)
+        _check_batch_size(body.items)
+        vectors = [it.vector for it in body.items]
+        results = await run_in_threadpool(
+            mem.anomaly_batch, vectors, body.beta, body.top_k, body.filter
+        )
+        for it, res in zip(body.items, results, strict=True):
+            res["id"] = it.id
+        return {"results": results, "count": len(results)}
+
+    @api.get("/memories/{name}/capacity", tags=["recall"])
+    async def capacity(name: str):
+        mem = store.get_memory(name)
+        return await run_in_threadpool(mem.capacity_report)
 
     # -- text convenience endpoints (built-in embedder) ------------------
     def _ensure_text_dim(mem) -> None:

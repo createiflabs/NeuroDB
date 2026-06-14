@@ -78,6 +78,8 @@ class Settings:
     rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int("NEURODB_RATE_LIMIT_PER_MINUTE", 600)
     )
+    # Max items in a single /anomaly/batch or /complete/batch request.
+    max_batch: int = field(default_factory=lambda: _env_int("NEURODB_MAX_BATCH", 1024))
     # Fail-closed on an unreadable data file instead of quarantining + empty start.
     fail_on_corrupt_load: bool = field(
         default_factory=lambda: _env_bool("NEURODB_FAIL_ON_CORRUPT_LOAD", False)

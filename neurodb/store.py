@@ -28,7 +28,7 @@ from typing import Any
 
 import numpy as np
 
-from .hopfield import retrieve
+from .hopfield import retrieve, softmax
 from .metrics import compute_scores
 
 logger = logging.getLogger("neurodb.store")
@@ -41,6 +41,15 @@ NORMALIZE_MODES = ("none", "zscore", "l2")
 # Floor for per-dimension std / row norm so a degenerate (constant / zero)
 # dimension or pattern never produces a division by zero (NaN/inf).
 _NORM_EPS = 1e-6
+
+# Capacity diagnostics: cap the pairwise/self-recall cost on large memories by
+# sampling, and the self-recall margin / status thresholds.
+_CAPACITY_SAMPLE = 256
+_SELF_RECALL_THRESHOLD = 0.9  # top weight must land on self and exceed this
+_CAPACITY_BETAS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)  # coarse suggested-β search
+# self-recall failure fraction → status
+_CROWDED_FRACTION = 0.1
+_SATURATED_FRACTION = 0.5
 
 
 def resolve_normalize(normalize: str | None, fields: list[str] | None) -> str:
@@ -229,6 +238,8 @@ class Memory:
         self._Z: np.ndarray | None = None
         self._mean: np.ndarray | None = None
         self._std: np.ndarray | None = None
+        # Cached capacity/saturation diagnostic (lazy; invalidated on mutation).
+        self._capacity: dict[str, Any] | None = None
         self._lock = threading.RLock()
         # Monotonic write version vs. the version last persisted. A memory is
         # dirty when they differ. This (rather than a bare bool) means a write
@@ -266,6 +277,7 @@ class Memory:
                 self._ensure_stats()
                 detail["mean"] = self._mean.tolist() if self._mean is not None else None
                 detail["std"] = self._std.tolist() if self._std is not None else None
+            detail["capacity"] = self.capacity_compact()
             return detail
 
     # -- normalization ----------------------------------------------------
@@ -296,21 +308,38 @@ class Memory:
             norms = np.maximum(np.linalg.norm(X, axis=1, keepdims=True), _NORM_EPS)
             self._Z = (X / norms).astype(np.float32)
 
-    def _normalized(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(Z, qz)``: the matrix and query in normalized space for the
-        active mode. Must be called under ``self._lock``. For ``"none"`` this is
-        ``(self._X, q)`` unchanged, so that path is bit-for-bit identical."""
+    def _matrix_Z(self) -> np.ndarray:
+        """The (cached) matrix the Hopfield step runs on for the active mode.
+        Must be called under ``self._lock``. For ``"none"`` this is ``self._X``
+        unchanged, so that path is bit-for-bit identical."""
 
         if self.normalize == "none":
-            return self._X, q
+            return self._X
+        self._ensure_stats()
+        return self._Z
+
+    def _normalize_query(self, q: np.ndarray) -> np.ndarray:
+        """Normalize a 1-D query ``(D,)`` or a 2-D batch ``(M, D)`` into the
+        active space. Must be called under ``self._lock``."""
+
+        if self.normalize == "none":
+            return q
         self._ensure_stats()
         if self.normalize == "zscore":
-            qz = ((q - self._mean) / self._std).astype(np.float32)
-            return self._Z, qz
-        # "l2": unit-normalize the query (a zero query stays zero).
-        qn = float(np.linalg.norm(q))
-        qz = (q / qn).astype(np.float32) if qn > _NORM_EPS else q.astype(np.float32)
-        return self._Z, qz
+            # Broadcasts over both the 1-D and the (M, D) batch case.
+            return ((q - self._mean) / self._std).astype(np.float32)
+        # "l2": project each row (or the single vector) onto the unit sphere;
+        # a zero vector stays zero.
+        if q.ndim == 1:
+            qn = float(np.linalg.norm(q))
+            return (q / qn).astype(np.float32) if qn > _NORM_EPS else q.astype(np.float32)
+        norms = np.maximum(np.linalg.norm(q, axis=1, keepdims=True), _NORM_EPS)
+        return (q / norms).astype(np.float32)
+
+    def _normalized(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Convenience: ``(matrix_Z, normalized_query)`` for the active mode."""
+
+        return self._matrix_Z(), self._normalize_query(q)
 
     def _denormalize(self, recon_z: np.ndarray) -> np.ndarray:
         """Map a reconstruction from normalized space back to raw units. For
@@ -332,6 +361,24 @@ class Memory:
             )
         if not np.all(np.isfinite(arr)):
             raise MemoryError_("Vector contains NaN or infinite values.")
+        return arr
+
+    def _coerce_batch(self, queries: Iterable[Iterable[float]]) -> np.ndarray:
+        """Validate a batch of query vectors into an ``(M, D)`` float32 array."""
+
+        try:
+            arr = np.asarray(queries, dtype=np.float32)
+        except (ValueError, TypeError) as exc:
+            raise MemoryError_(f"Invalid batch (ragged or non-numeric): {exc}") from exc
+        if arr.size == 0:  # empty batch (e.g. [] or shape (0, D))
+            return np.zeros((0, self.dimension), dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != self.dimension:
+            raise MemoryError_(
+                f"Batch must be a 2-D array of {self.dimension}-d vectors; "
+                f"got shape {arr.shape}."
+            )
+        if not np.all(np.isfinite(arr)):
+            raise MemoryError_("Batch contains NaN or infinite values.")
         return arr
 
     def _mask_from_indices(self, indices: Iterable[int] | None) -> np.ndarray | None:
@@ -359,6 +406,7 @@ class Memory:
         self._Z = None
         self._mean = None
         self._std = None
+        self._capacity = None
 
     # -- writing (append a pattern) --------------------------------------
     def write(self, items: Iterable[dict[str, Any]]) -> list[str]:
@@ -436,6 +484,77 @@ class Memory:
             self._version += 1
             return len(targets)
 
+    # -- updating an existing pattern ------------------------------------
+    def _resolve_field(self, field: int | str) -> int:
+        """Map a field index or (when ``fields`` are named) a field name to an
+        in-range dimension index."""
+
+        if isinstance(field, str):
+            if not self.fields or field not in self.fields:
+                raise MemoryError_(f"unknown field name {field!r}.")
+            i = self.fields.index(field)
+        else:
+            i = int(field)
+        if not (0 <= i < self.dimension):
+            raise MemoryError_(f"field index {i} out of range [0, {self.dimension}).")
+        return i
+
+    def update(
+        self,
+        _id: str,
+        vector: Iterable[float] | None = None,
+        metadata: dict[str, Any] | None = None,
+        merge_metadata: bool = True,
+    ) -> dict[str, Any]:
+        """Update a stored pattern in place. ``vector`` replaces the row;
+        ``metadata`` shallow-merges (or replaces when ``merge_metadata`` is
+        False). Returns the updated pattern (same shape as :meth:`get`)."""
+
+        with self._lock:
+            if _id not in self._index:
+                raise NotFoundError(f"Pattern {_id!r} not found in memory {self.name!r}.")
+            idx = self._index[_id]
+            changed = False
+            if vector is not None:
+                self._X[idx] = self._coerce_vector(vector)
+                self._invalidate_caches()  # norms/stats/Z depend on the matrix
+                changed = True
+            if metadata is not None:
+                if merge_metadata:
+                    merged = dict(self.metadata[idx])
+                    merged.update(metadata)
+                    self.metadata[idx] = merged
+                else:
+                    self.metadata[idx] = dict(metadata)
+                changed = True
+            if changed:
+                self._version += 1
+            return {
+                "id": _id,
+                "vector": self._X[idx].tolist(),
+                "metadata": copy.deepcopy(self.metadata[idx]),
+            }
+
+    def update_field(self, _id: str, field: int | str, value: float) -> dict[str, Any]:
+        """Edit a single field of a structured record (by index or field name)."""
+
+        with self._lock:
+            if _id not in self._index:
+                raise NotFoundError(f"Pattern {_id!r} not found in memory {self.name!r}.")
+            fi = self._resolve_field(field)
+            v = float(value)
+            if not np.isfinite(v):
+                raise MemoryError_("field value must be finite.")
+            idx = self._index[_id]
+            self._X[idx, fi] = v
+            self._invalidate_caches()
+            self._version += 1
+            return {
+                "id": _id,
+                "vector": self._X[idx].tolist(),
+                "metadata": copy.deepcopy(self.metadata[idx]),
+            }
+
     # -- content-addressable operations ----------------------------------
     @staticmethod
     def _top_k_indices(scores: np.ndarray, k: int) -> np.ndarray:
@@ -448,18 +567,74 @@ class Memory:
         top = np.argpartition(-scores, k - 1)[:k]
         return top[np.argsort(-scores[top], kind="stable")]
 
-    def _contributors(self, weights: np.ndarray, top_k: int) -> list[dict[str, Any]]:
+    def _contributors(
+        self,
+        weights: np.ndarray,
+        top_k: int,
+        ids: list[str] | None = None,
+        metadata: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        # ``ids``/``metadata`` default to the whole memory, but a filtered call
+        # passes the candidate-aligned slices so weights map to the right rows.
         if weights.shape[0] == 0:
             return []
+        ids = self.ids if ids is None else ids
+        metadata = self.metadata if metadata is None else metadata
         top = self._top_k_indices(weights, top_k)
         return [
             {
-                "id": self.ids[int(i)],
+                "id": ids[int(i)],
                 "weight": float(weights[int(i)]),
-                "metadata": copy.deepcopy(self.metadata[int(i)]),
+                "metadata": copy.deepcopy(metadata[int(i)]),
             }
             for i in top
         ]
+
+    # -- shared result builders / candidate selection --------------------
+    def _empty_complete(self, b: float, steps: int) -> dict[str, Any]:
+        # Empty memory (or a filter matching nothing) has nothing to recall —
+        # mirror search()'s empty result rather than erroring (200 contract).
+        return {
+            "reconstruction": None,
+            "weights": [],
+            "top": None,
+            "beta": b,
+            "steps": max(1, steps),
+        }
+
+    def _empty_anomaly(self, b: float) -> dict[str, Any]:
+        return {
+            "score": 0.0,
+            "z_score": 0.0,
+            "reconstruction": None,
+            "residual": [],
+            "fields": [],
+            "nearest": None,
+            "beta": b,
+        }
+
+    def _candidates(
+        self, flt: dict[str, Any] | None
+    ) -> tuple[np.ndarray, list[str], list[dict[str, Any]]] | None:
+        """Normalized candidate matrix + aligned ids/metadata for the metadata
+        filter (same semantics as :meth:`search`). Returns ``None`` when the
+        filter excludes every pattern. Must be called under ``self._lock``.
+
+        zscore/l2 statistics are always computed over the **full** memory (stable
+        and already cached); only the candidate *rows* are filtered out — so a
+        record is scored against same-type patterns but normalized by the global
+        distribution.
+        """
+
+        Z = self._matrix_Z()
+        if not flt:
+            return Z, self.ids, self.metadata
+        validate_filter(flt)
+        keep = [i for i in range(self._X.shape[0]) if _match_filter(self.metadata[i], flt)]
+        if not keep:
+            return None
+        idx = np.asarray(keep, dtype=np.int64)
+        return Z[idx], [self.ids[i] for i in keep], [self.metadata[i] for i in keep]
 
     def complete(
         self,
@@ -468,32 +643,30 @@ class Memory:
         mask: Iterable[int] | None = None,
         steps: int = 1,
         top_k: int = 5,
+        flt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Content-addressable recall / pattern completion via one (or more)
-        Hopfield attention steps."""
+        Hopfield attention steps. ``flt`` restricts recall to patterns whose
+        metadata matches (same filter syntax as :meth:`search`)."""
 
         with self._lock:
             b = float(beta) if beta is not None else self.beta
             if self._X.shape[0] == 0:
-                # Empty memory has nothing to recall — mirror search()'s empty
-                # result rather than erroring (consistent 200 contract).
-                return {
-                    "reconstruction": None,
-                    "weights": [],
-                    "top": None,
-                    "beta": b,
-                    "steps": max(1, steps),
-                }
+                return self._empty_complete(b, steps)
             q = self._coerce_vector(query)
             mask_arr = self._mask_from_indices(mask)
+            cand = self._candidates(flt)
+            if cand is None:
+                return self._empty_complete(b, steps)
+            Z, ids, meta = cand
             # Run the Hopfield step in normalized space, then map the result
             # back to raw units. The mask clamp inside retrieve() therefore
             # clamps in normalized space (qz[mask]); de-normalizing afterwards
             # restores the known fields to their exact raw values.
-            Z, qz = self._normalized(q)
+            qz = self._normalize_query(q)
             recon_z, weights = retrieve(Z, qz, b, mask_arr, steps)
             recon = self._denormalize(recon_z)
-            contributors = self._contributors(weights, top_k)
+            contributors = self._contributors(weights, top_k, ids, meta)
             return {
                 "reconstruction": recon.tolist(),
                 "weights": contributors,
@@ -501,6 +674,47 @@ class Memory:
                 "beta": b,
                 "steps": max(1, steps),
             }
+
+    def complete_batch(
+        self,
+        queries: Iterable[Iterable[float]],
+        beta: float | None = None,
+        mask: Iterable[int] | None = None,
+        steps: int = 1,
+        top_k: int = 5,
+        flt: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Vectorized :meth:`complete` over a batch of queries. The whole batch
+        is one matmul under a single lock — no per-query Python loop over the
+        attention step. Returns one result per input row, in order."""
+
+        with self._lock:
+            b = float(beta) if beta is not None else self.beta
+            Q = self._coerce_batch(queries)
+            m = Q.shape[0]
+            if m == 0:
+                return []
+            mask_arr = self._mask_from_indices(mask)
+            cand = self._candidates(flt) if self._X.shape[0] else None
+            if cand is None:
+                return [self._empty_complete(b, steps) for _ in range(m)]
+            Z, ids, meta = cand
+            Qz = self._normalize_query(Q)
+            recon_z, weights = retrieve(Z, Qz, b, mask_arr, steps)
+            recon = self._denormalize(recon_z)
+            results: list[dict[str, Any]] = []
+            for i in range(m):
+                contributors = self._contributors(weights[i], top_k, ids, meta)
+                results.append(
+                    {
+                        "reconstruction": recon[i].tolist(),
+                        "weights": contributors,
+                        "top": contributors[0] if contributors else None,
+                        "beta": b,
+                        "steps": max(1, steps),
+                    }
+                )
+            return results
 
     def search(
         self,
@@ -553,72 +767,227 @@ class Memory:
                 results.append(row)
             return results
 
+    def _anomaly_result(
+        self,
+        q: np.ndarray,
+        recon: np.ndarray,
+        qz: np.ndarray,
+        recon_z: np.ndarray,
+        weights: np.ndarray,
+        ids: list[str],
+        meta: list[dict[str, Any]],
+        b: float,
+        top_k: int,
+    ) -> dict[str, Any]:
+        """Assemble one anomaly report from a (single or per-row) recall result.
+
+        Shared by :meth:`anomaly` and :meth:`anomaly_batch` so a batch row is
+        element-for-element identical to the single-query call.
+        """
+
+        # Raw residual (original contract) and its normalized counterpart.
+        # z_residual is "how many std-devs off" per field, comparable across
+        # fields of different scale — the meaningful anomaly signal under
+        # zscore. For "none"/"l2" qz==q and recon_z==recon (l2 on the unit
+        # sphere), so the z-* figures coincide with the raw ones.
+        residual = np.abs(q - recon)
+        z_residual = np.abs(qz - recon_z)
+        score = float(np.linalg.norm(q - recon))
+        z_score = float(np.linalg.norm(qz - recon_z))
+        # Rank by the standardized deviation when zscore (cross-field
+        # comparable), otherwise by the raw deviation as before.
+        ranking = z_residual if self.normalize == "zscore" else residual
+        order = np.argsort(-ranking, kind="stable")
+        limit = min(max(top_k, 0), self.dimension)
+        fields = []
+        for idx in order[:limit]:
+            idx = int(idx)
+            fields.append(
+                {
+                    "index": idx,
+                    "name": self.fields[idx] if self.fields else None,
+                    "value": float(q[idx]),
+                    "expected": float(recon[idx]),
+                    "deviation": float(residual[idx]),
+                    "z_deviation": float(z_residual[idx]),
+                }
+            )
+        nearest = self._contributors(weights, 1, ids, meta)
+        return {
+            "score": score,
+            "z_score": z_score,
+            "reconstruction": recon.tolist(),
+            "residual": residual.tolist(),
+            "fields": fields,
+            "nearest": nearest[0] if nearest else None,
+            "beta": b,
+        }
+
     def anomaly(
         self,
         query: Iterable[float],
         beta: float | None = None,
         top_k: int = 5,
+        flt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Per-field anomaly detection.
 
         Recall the pattern the input most resembles, then report where the input
         deviates from that reconstruction field-by-field. Fields with the largest
-        absolute deviation are the most anomalous.
+        absolute deviation are the most anomalous. ``flt`` restricts recall to
+        patterns whose metadata matches (same syntax as :meth:`search`) — e.g.
+        score a record only against others of the same type.
         """
 
         with self._lock:
             b = float(beta) if beta is not None else self.beta
             if self._X.shape[0] == 0:
-                return {
-                    "score": 0.0,
-                    "z_score": 0.0,
-                    "reconstruction": None,
-                    "residual": [],
-                    "fields": [],
-                    "nearest": None,
-                    "beta": b,
-                }
+                return self._empty_anomaly(b)
             q = self._coerce_vector(query)
-            Z, qz = self._normalized(q)
+            cand = self._candidates(flt)
+            if cand is None:
+                return self._empty_anomaly(b)
+            Z, ids, meta = cand
+            qz = self._normalize_query(q)
             recon_z, weights = retrieve(Z, qz, b, None, 1)
             recon = self._denormalize(recon_z)
-            # Raw residual (original contract) and its normalized counterpart.
-            # z_residual is "how many std-devs off" per field, comparable across
-            # fields of different scale — the meaningful anomaly signal under
-            # zscore. For "none"/"l2" qz==q and recon_z==recon (l2 on the unit
-            # sphere), so the z-* figures coincide with the raw ones.
-            residual = np.abs(q - recon)
-            z_residual = np.abs(qz - recon_z)
-            score = float(np.linalg.norm(q - recon))
-            z_score = float(np.linalg.norm(qz - recon_z))
-            # Rank by the standardized deviation when zscore (cross-field
-            # comparable), otherwise by the raw deviation as before.
-            ranking = z_residual if self.normalize == "zscore" else residual
-            order = np.argsort(-ranking, kind="stable")
-            limit = min(max(top_k, 0), self.dimension)
-            fields = []
-            for idx in order[:limit]:
-                idx = int(idx)
-                fields.append(
+            return self._anomaly_result(q, recon, qz, recon_z, weights, ids, meta, b, top_k)
+
+    def anomaly_batch(
+        self,
+        queries: Iterable[Iterable[float]],
+        beta: float | None = None,
+        top_k: int = 5,
+        flt: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Vectorized :meth:`anomaly` over a batch of queries — one matmul under
+        a single lock. Returns one report per input row, in order."""
+
+        with self._lock:
+            b = float(beta) if beta is not None else self.beta
+            Q = self._coerce_batch(queries)
+            m = Q.shape[0]
+            if m == 0:
+                return []
+            cand = self._candidates(flt) if self._X.shape[0] else None
+            if cand is None:
+                return [self._empty_anomaly(b) for _ in range(m)]
+            Z, ids, meta = cand
+            Qz = self._normalize_query(Q)
+            recon_z, weights = retrieve(Z, Qz, b, None, 1)
+            recon = self._denormalize(recon_z)
+            return [
+                self._anomaly_result(
+                    Q[i], recon[i], Qz[i], recon_z[i], weights[i], ids, meta, b, top_k
+                )
+                for i in range(m)
+            ]
+
+    # -- capacity / saturation diagnostics -------------------------------
+    def capacity_report(self) -> dict[str, Any]:
+        """Hopfield storage-capacity / saturation diagnostic.
+
+        Modern Hopfield memories have finite capacity: past it, distinct
+        patterns' attractors merge and recall *silently* returns blends. This
+        reports honest signals of that:
+
+        * ``mean/max_pairwise_similarity`` — cosine similarity between (normalized)
+          stored patterns; a high max means those two will be confused at any β.
+        * ``self_recall_fail_fraction`` — fraction of sampled patterns that, when
+          queried with their *own* stored vector at the memory's β, do **not**
+          retrieve themselves with top weight ≥ 0.9. If a pattern can't recall
+          itself, the memory is over capacity for its β.
+        * ``suggested_beta`` — smallest β (coarse, heuristic search) at which the
+          sample self-recalls cleanly, or ``None`` if none of the tried β reach it.
+        * ``status`` — ``healthy`` (< 10% fail) / ``crowded`` (< 50%) / ``saturated``.
+
+        On large memories the pairwise and self-recall costs are bounded by
+        sampling ``_CAPACITY_SAMPLE`` patterns (deterministic seed). The result
+        is cached until the next mutation.
+        """
+
+        with self._lock:
+            if self._capacity is not None:
+                return copy.deepcopy(self._capacity)
+            n = self._X.shape[0]
+            report: dict[str, Any] = {
+                "count": n,
+                "dimension": self.dimension,
+                "beta": self.beta,
+                "normalize": self.normalize,
+                "sampled": min(n, _CAPACITY_SAMPLE),
+            }
+            if n == 0:
+                report.update(
                     {
-                        "index": idx,
-                        "name": self.fields[idx] if self.fields else None,
-                        "value": float(q[idx]),
-                        "expected": float(recon[idx]),
-                        "deviation": float(residual[idx]),
-                        "z_deviation": float(z_residual[idx]),
+                        "mean_pairwise_similarity": None,
+                        "max_pairwise_similarity": None,
+                        "self_recall_fail_fraction": 0.0,
+                        "suggested_beta": None,
+                        "status": "healthy",
                     }
                 )
-            nearest = self._contributors(weights, 1)
-            return {
-                "score": score,
-                "z_score": z_score,
-                "reconstruction": recon.tolist(),
-                "residual": residual.tolist(),
-                "fields": fields,
-                "nearest": nearest[0] if nearest else None,
-                "beta": b,
-            }
+                self._capacity = report
+                return copy.deepcopy(report)
+
+            Z = self._matrix_Z()
+            # Deterministic sample so the diagnostic is reproducible.
+            if n > _CAPACITY_SAMPLE:
+                rng = np.random.default_rng(0)
+                sample = np.sort(rng.choice(n, size=_CAPACITY_SAMPLE, replace=False))
+            else:
+                sample = np.arange(n)
+
+            # Pairwise cosine similarity among sampled (normalized) patterns.
+            rows = Z[sample].astype(np.float64)
+            unit = rows / np.maximum(np.linalg.norm(rows, axis=1, keepdims=True), _NORM_EPS)
+            sim = unit @ unit.T
+            k = sim.shape[0]
+            if k > 1:
+                off = sim[np.triu_indices(k, k=1)]
+                report["mean_pairwise_similarity"] = float(off.mean())
+                report["max_pairwise_similarity"] = float(off.max())
+            else:
+                report["mean_pairwise_similarity"] = 0.0
+                report["max_pairwise_similarity"] = 0.0
+
+            # Self-recall: query the FULL memory with each sampled pattern's own
+            # normalized vector; pre-softmax sims are reused across betas.
+            Qz = self._normalize_query(self._X[sample])
+            sims = (Qz @ Z.T).astype(np.float64)  # (sample, N)
+            rowidx = np.arange(sample.shape[0])
+
+            def fail_fraction(beta: float) -> float:
+                w = softmax(beta * sims, axis=1)
+                top_idx = np.argmax(w, axis=1)
+                top_w = w[rowidx, top_idx]
+                hits = (top_idx == sample) & (top_w >= _SELF_RECALL_THRESHOLD)
+                return float(1.0 - hits.mean())
+
+            fail = fail_fraction(self.beta)
+            report["self_recall_fail_fraction"] = fail
+            suggested = next(
+                (b for b in _CAPACITY_BETAS if fail_fraction(b) <= _CROWDED_FRACTION), None
+            )
+            report["suggested_beta"] = suggested
+            if fail >= _SATURATED_FRACTION:
+                report["status"] = "saturated"
+            elif fail >= _CROWDED_FRACTION:
+                report["status"] = "crowded"
+            else:
+                report["status"] = "healthy"
+
+            self._capacity = report
+            return copy.deepcopy(report)
+
+    def capacity_compact(self) -> dict[str, Any]:
+        """The headline capacity fields for /stats and /health (cached)."""
+
+        full = self.capacity_report()
+        return {
+            "status": full["status"],
+            "self_recall_fail_fraction": full["self_recall_fail_fraction"],
+        }
 
     # -- (de)serialisation for single-file persistence -------------------
     def snapshot(self) -> MemorySnapshot:
@@ -733,6 +1102,13 @@ class NeuroStore:
     def count_memories(self) -> int:
         with self._lock:
             return len(self._memories)
+
+    def counts(self) -> tuple[int, int]:
+        """Cheap ``(memories, patterns)`` totals without the capacity diagnostic
+        (used by hot endpoints like /metrics)."""
+
+        with self._lock:
+            return len(self._memories), sum(m.count for m in self._memories.values())
 
     def delete_memory(self, name: str) -> None:
         with self._lock:

@@ -22,11 +22,13 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from . import __version__
+from .collections.bundle import BundleError
 from .config import Settings, get_settings
 from .embedding import embed_text
 from .models import (
     AnomalyBatchRequest,
     AnomalyRequest,
+    CollectionLoadRequest,
     CompleteBatchRequest,
     CompleteRequest,
     CreateMemoryRequest,
@@ -280,6 +282,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _limit_exceeded(request, exc: LimitExceededError):
         return _error_response(request, 413, "limit_exceeded", str(exc))
 
+    @app.exception_handler(BundleError)
+    async def _bundle_error(request, exc: BundleError):
+        return _error_response(request, 400, "bad_collection", str(exc))
+
     @app.exception_handler(StoreError)
     async def _store_error(request, exc: StoreError):
         return _error_response(request, 400, "bad_request", str(exc))
@@ -411,6 +417,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         persisted = await run_in_threadpool(store.flush)
         return {"persisted": persisted, "durable": True}
+
+    @api.post("/collections/load", tags=["collections"], status_code=201)
+    async def load_collection(body: CollectionLoadRequest):
+        """Load a signed/validated collection bundle (admin: same API key as the
+        data API). The bundle path must be accessible to the server."""
+
+        mem = await run_in_threadpool(store.load_collection, body.path, body.name)
+        return mem.info()
+
+    @api.get("/collections/{name}", tags=["collections"])
+    async def collection_info(name: str):
+        """Schema, criteria, provenance, attestation and signature status of a
+        loaded collection — without re-reading the patterns."""
+
+        mem = store.get_memory(name)
+        if mem.collection is None:
+            raise NotFoundError(f"Memory {name!r} is not a loaded collection.")
+        return {
+            "name": mem.name,
+            "dimension": mem.dimension,
+            "count": mem.count,
+            "normalize": mem.normalize,
+            **mem.collection,
+        }
 
     @api.post("/memories", tags=["memories"], status_code=201)
     async def create_memory(body: CreateMemoryRequest):

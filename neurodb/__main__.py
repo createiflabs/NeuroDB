@@ -78,6 +78,24 @@ def _cmd_migrate(args: argparse.Namespace) -> None:
     print(f"migrated {data_file}: manifest v{before} -> v{after}")
 
 
+def _cmd_collection(args: argparse.Namespace) -> None:
+    import json
+
+    from .collections import bundle as bundle_mod
+
+    if args.collection_command == "info":
+        print(json.dumps(bundle_mod.info(args.bundle), indent=2, default=str))
+    elif args.collection_command == "verify":
+        result = bundle_mod.verify_bundle(args.bundle)
+        print(json.dumps(result.to_dict(), indent=2))
+    elif args.collection_command == "load":
+        from .store import NeuroStore
+
+        store = NeuroStore(_data_file(args))
+        mem = store.load_collection(args.bundle, args.name)
+        print(f"loaded collection {mem.name!r} ({mem.count} patterns) into {_data_file(args)}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="neurodb", description="NeuroDB CLI")
     sub = parser.add_subparsers(dest="command")
@@ -95,6 +113,17 @@ def main(argv: list[str] | None = None) -> None:
     p_migrate = sub.add_parser("migrate", help="upgrade the data file to the current format")
     p_migrate.add_argument("--data-file", help="override NEURODB_DATA_FILE")
 
+    p_coll = sub.add_parser("collection", help="inspect/verify/load collection bundles")
+    coll_sub = p_coll.add_subparsers(dest="collection_command", required=True)
+    p_ci = coll_sub.add_parser("info", help="print a bundle's metadata (no patterns)")
+    p_ci.add_argument("bundle")
+    p_cv = coll_sub.add_parser("verify", help="verify a bundle's signature")
+    p_cv.add_argument("bundle")
+    p_cl = coll_sub.add_parser("load", help="load a bundle into the data file")
+    p_cl.add_argument("bundle")
+    p_cl.add_argument("--name", help="override the collection name")
+    p_cl.add_argument("--data-file", help="override NEURODB_DATA_FILE")
+
     args = parser.parse_args(argv)
 
     if args.command in (None, "serve"):
@@ -105,6 +134,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_restore(args)
     elif args.command == "migrate":
         _cmd_migrate(args)
+    elif args.command == "collection":
+        _cmd_collection(args)
     else:  # pragma: no cover - argparse rejects unknown commands
         parser.print_help()
         sys.exit(2)

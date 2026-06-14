@@ -183,3 +183,12 @@ class TextSearchRequest(BaseModel):
 
 class EmbedRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=TEXT_MAX)
+
+
+class CollectionLoadRequest(BaseModel):
+    """Load a collection bundle from a server-accessible path into a memory."""
+
+    path: str = Field(..., min_length=1, max_length=4096, description="Server-side bundle path.")
+    name: str | None = Field(
+        None, max_length=128, description="Override the collection's name on load."
+    )

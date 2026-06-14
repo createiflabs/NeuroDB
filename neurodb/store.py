@@ -253,6 +253,9 @@ class Memory:
         # landing during a save is never silently marked clean — see save().
         self._version = 0
         self._saved_version = 0
+        # Collection metadata when this memory was materialized from a bundle
+        # (schema/criteria/provenance/attestation/signature summary); else None.
+        self.collection: dict[str, Any] | None = None
 
     # -- introspection ----------------------------------------------------
     @property
@@ -277,7 +280,7 @@ class Memory:
         return int(raw * 2 if self.normalize != "none" else raw)
 
     def info(self) -> dict[str, Any]:
-        return {
+        detail = {
             "name": self.name,
             "dimension": self.dimension,
             "beta": self.beta,
@@ -285,6 +288,9 @@ class Memory:
             "count": self.count,
             "normalize": self.normalize,
         }
+        if self.collection is not None:
+            detail["collection"] = self.collection
+        return detail
 
     def stats(self) -> dict[str, Any]:
         """:meth:`info` plus, for ``zscore`` memories, the per-dimension
@@ -1131,6 +1137,47 @@ class NeuroStore:
                 raise MemoryError_(f"Memory {name!r} already exists.")
             mem = Memory(name, dimension, beta, fields, normalize)
             self._memories[name] = mem
+            self.save()
+            return mem
+
+    def load_collection(self, bundle_path: str | Path, name: str | None = None) -> Memory:
+        """Materialize a memory from a signed/validated collection bundle.
+
+        Verifies the signature (via the active license seam), enforces required
+        provenance, then loads the patterns + schema as a ready-to-score memory.
+        """
+
+        from .collections import bundle as bundle_mod
+        from .collections.license import get_license
+
+        manifest = bundle_mod.read_manifest(bundle_path)
+        bundle_mod.validate_manifest(manifest)  # required provenance, etc.
+        verification = bundle_mod.verify_bundle(bundle_path)
+        get_license().check(manifest, verification)
+
+        patterns = bundle_mod.read_patterns(bundle_path)
+        coll_name = name or manifest["name"]
+        fields = [f["name"] for f in manifest["schema"]["fields"]]
+        att = manifest.get("attestation")
+        with self._lock:
+            if coll_name in self._memories:
+                raise MemoryError_(f"Memory {coll_name!r} already exists.")
+            mem = Memory(
+                coll_name,
+                manifest["dimension"],
+                float(manifest.get("beta", 8.0)),
+                fields,
+                manifest.get("normalize"),
+            )
+            mem.write([{"vector": row.tolist()} for row in patterns])
+            mem.collection = {
+                "criteria": manifest.get("criteria"),
+                "provenance": manifest.get("provenance"),
+                "schema": manifest.get("schema"),
+                "attested": bool(att),
+                "signature": verification.to_dict(),
+            }
+            self._memories[coll_name] = mem
             self.save()
             return mem
 

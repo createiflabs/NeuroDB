@@ -60,6 +60,24 @@ def _cmd_restore(args: argparse.Namespace) -> None:
         print(f"previous data file preserved at {preserved}")
 
 
+def _cmd_migrate(args: argparse.Namespace) -> None:
+    from .store import _MANIFEST_VERSION, NeuroStore, peek_manifest_version
+
+    data_file = _data_file(args)
+    before = peek_manifest_version(data_file)
+    if before is None:
+        print(f"no data file (or no manifest) at {data_file}; nothing to migrate")
+        return
+    if before == _MANIFEST_VERSION:
+        print(f"data file already at manifest v{before}; no migration needed")
+        return
+    # Loading migrates in memory; saving stamps the current version on disk.
+    store = NeuroStore(data_file, fail_on_corrupt_load=True)
+    store.save_all()
+    after = peek_manifest_version(data_file)
+    print(f"migrated {data_file}: manifest v{before} -> v{after}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="neurodb", description="NeuroDB CLI")
     sub = parser.add_subparsers(dest="command")
@@ -74,6 +92,9 @@ def main(argv: list[str] | None = None) -> None:
     p_restore.add_argument("src", help="backup file to restore from")
     p_restore.add_argument("--data-file", help="override NEURODB_DATA_FILE")
 
+    p_migrate = sub.add_parser("migrate", help="upgrade the data file to the current format")
+    p_migrate.add_argument("--data-file", help="override NEURODB_DATA_FILE")
+
     args = parser.parse_args(argv)
 
     if args.command in (None, "serve"):
@@ -82,6 +103,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_backup(args)
     elif args.command == "restore":
         _cmd_restore(args)
+    elif args.command == "migrate":
+        _cmd_migrate(args)
     else:  # pragma: no cover - argparse rejects unknown commands
         parser.print_help()
         sys.exit(2)

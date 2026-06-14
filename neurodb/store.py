@@ -30,11 +30,14 @@ import numpy as np
 
 from .hopfield import retrieve, softmax
 from .metrics import compute_scores
+from .migrations import migrate
 
 logger = logging.getLogger("neurodb.store")
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_MANIFEST_VERSION = 1
+# Bump on any manifest format change AND register a migration in migrations.py
+# (every version transition must have an explicit, tested function).
+_MANIFEST_VERSION = 2
 
 # Per-memory normalization modes applied before the Hopfield attention step.
 NORMALIZE_MODES = ("none", "zscore", "l2")
@@ -1054,6 +1057,25 @@ class Memory:
         return mem
 
 
+def peek_manifest_version(path: str | Path) -> int | None:
+    """Read just the manifest version from a data file without loading memories.
+    Returns ``None`` if the file is absent or has no readable manifest."""
+
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as handle:
+            with np.load(handle, allow_pickle=False) as data:
+                if "__manifest__" not in data:
+                    return None
+                manifest = json.loads(bytes(data["__manifest__"]).decode("utf-8"))
+                version = manifest.get("version")
+                return int(version) if version is not None else None
+    except Exception:
+        return None
+
+
 class NeuroStore:
     """Owns every :class:`Memory` and persists them all to a single ``.npz`` file."""
 
@@ -1162,13 +1184,28 @@ class NeuroStore:
                     raise StoreError("data file is missing its __manifest__ entry.")
                 manifest = json.loads(bytes(data["__manifest__"]).decode("utf-8"))
                 version = manifest.get("version")
-                if version is None or version > _MANIFEST_VERSION:
-                    raise StoreError(f"unsupported manifest version {version!r}.")
+                if version is None:
+                    raise StoreError("data file manifest is missing its version.")
+                if version > _MANIFEST_VERSION:
+                    raise StoreError(
+                        f"data file was written by a newer NeuroDB (manifest "
+                        f"v{version}); this build supports up to v{_MANIFEST_VERSION}. "
+                        "Upgrade NeuroDB or restore an older backup."
+                    )
+                # Bring an older file forward in memory before building memories.
+                # Non-destructive: the source file is untouched; the upgraded
+                # version is stamped on the next normal save.
+                arrays: dict[str, np.ndarray] | Any = data
+                if version < _MANIFEST_VERSION:
+                    arrays = {k: data[k] for k in data.files if k != "__manifest__"}
+                    manifest, arrays = migrate(
+                        manifest, arrays, target_version=_MANIFEST_VERSION
+                    )
                 for entry in manifest.get("memories", []):
                     key = f"X@{entry['name']}"
-                    if key not in data:
+                    if key not in arrays:
                         raise StoreError(f"missing matrix for memory {entry['name']!r}.")
-                    mem = Memory.from_manifest(entry, data[key])
+                    mem = Memory.from_manifest(entry, arrays[key])
                     loaded[mem.name] = mem
         # Commit only after the whole file parses + validates (all-or-nothing).
         self._memories.update(loaded)

@@ -38,7 +38,7 @@ from .models import (
     WriteRequest,
 )
 from .observability import CONTENT_TYPE_LATEST, Metrics, request_id_var
-from .store import MemoryError_, NeuroStore, NotFoundError, StoreError
+from .store import LimitExceededError, MemoryError_, NeuroStore, NotFoundError, StoreError
 
 logger = logging.getLogger("neurodb")
 
@@ -122,7 +122,12 @@ async def _autosave_loop(store: NeuroStore, interval: float, metrics: Metrics) -
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    store = NeuroStore(settings.data_file, fail_on_corrupt_load=settings.fail_on_corrupt_load)
+    store = NeuroStore(
+        settings.data_file,
+        fail_on_corrupt_load=settings.fail_on_corrupt_load,
+        max_patterns_per_memory=settings.max_patterns_per_memory,
+        max_total_bytes=settings.max_total_bytes,
+    )
     metrics = Metrics()
 
     @asynccontextmanager
@@ -242,6 +247,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _not_found(request, exc: NotFoundError):
         return _error_response(request, 404, "not_found", str(exc))
 
+    @app.exception_handler(LimitExceededError)
+    async def _limit_exceeded(request, exc: LimitExceededError):
+        return _error_response(request, 413, "limit_exceeded", str(exc))
+
     @app.exception_handler(StoreError)
     async def _store_error(request, exc: StoreError):
         return _error_response(request, 400, "bad_request", str(exc))
@@ -297,12 +306,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         saturated = sum(
             1 for m in stats["detail"] if m.get("capacity", {}).get("status") == "saturated"
         )
+        # Memory-pressure flag: over the configured % of the byte budget. Only
+        # meaningful when a budget is set; False otherwise.
+        pct = stats.get("pct_of_budget")
+        memory_pressure = pct is not None and pct >= settings.memory_pressure_pct
         return {
             "status": "ok",
             "version": __version__,
             "memories": stats["memories"],
             "patterns": stats["patterns"],
             "saturated_memories": saturated,
+            "approx_bytes": stats["approx_bytes"],
+            "memory_pressure": memory_pressure,
         }
 
     @app.get("/ready", tags=["system"])
@@ -389,6 +404,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @api.post("/memories/{name}/patterns", tags=["patterns"])
     async def write_patterns(name: str, body: WriteRequest):
         mem = store.get_memory(name)
+        store.check_write(name, len(body.items), mem.dimension, mem.normalize)
         items = [item.model_dump() for item in body.items]
         affected = await run_in_threadpool(mem.write, items)
         return {"written": len(affected), "ids": affected}
@@ -484,6 +500,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def write_texts(name: str, body: TextWriteRequest):
         mem = store.get_memory(name)
         _ensure_text_dim(mem)
+        store.check_write(name, len(body.items), mem.dimension, mem.normalize)
         items = []
         for item in body.items:
             meta = dict(item.metadata)

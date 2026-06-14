@@ -85,6 +85,10 @@ class NotFoundError(StoreError):
     """A requested memory or pattern does not exist (maps to HTTP 404)."""
 
 
+class LimitExceededError(StoreError):
+    """A write would breach a configured resource ceiling (maps to HTTP 413)."""
+
+
 # Public, clearly-named alias (``MemoryError`` is a Python builtin).
 MemoryError = MemoryError_
 
@@ -259,6 +263,19 @@ class Memory:
     def dirty(self) -> bool:
         return self._version != self._saved_version
 
+    @property
+    def approx_bytes(self) -> int:
+        """Estimated in-process footprint of this memory's matrices.
+
+        The raw matrix is ``N x D x 4`` bytes; ``zscore``/``l2`` modes keep a
+        cached normalized matrix ``_Z`` of the same size, so they cost roughly
+        double. ``_Z`` is counted whether or not it is currently materialized,
+        because it will be on the first recall — budget honesty over precision.
+        """
+
+        raw = self._X.nbytes
+        return int(raw * 2 if self.normalize != "none" else raw)
+
     def info(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -281,6 +298,7 @@ class Memory:
                 detail["mean"] = self._mean.tolist() if self._mean is not None else None
                 detail["std"] = self._std.tolist() if self._std is not None else None
             detail["capacity"] = self.capacity_compact()
+            detail["approx_bytes"] = self.approx_bytes
             return detail
 
     # -- normalization ----------------------------------------------------
@@ -1079,9 +1097,19 @@ def peek_manifest_version(path: str | Path) -> int | None:
 class NeuroStore:
     """Owns every :class:`Memory` and persists them all to a single ``.npz`` file."""
 
-    def __init__(self, data_file: str | Path, fail_on_corrupt_load: bool = False) -> None:
+    def __init__(
+        self,
+        data_file: str | Path,
+        fail_on_corrupt_load: bool = False,
+        max_patterns_per_memory: int = 0,
+        max_total_bytes: int = 0,
+    ) -> None:
         self.data_file = Path(data_file)
         self.fail_on_corrupt_load = fail_on_corrupt_load
+        # Resource ceilings (0 = unlimited); enforced by check_write before any
+        # allocation, so a runaway writer is rejected rather than OOM-killing.
+        self.max_patterns_per_memory = max_patterns_per_memory
+        self.max_total_bytes = max_total_bytes
         self._memories: dict[str, Memory] = {}
         self._lock = threading.RLock()
         # Readiness signal: did the most recent persist succeed?
@@ -1139,15 +1167,65 @@ class NeuroStore:
             del self._memories[name]
             self.save()
 
+    def approx_total_bytes(self) -> int:
+        """Estimated in-process footprint across all memories (matrices + caches)."""
+
+        with self._lock:
+            return sum(m.approx_bytes for m in self._memories.values())
+
+    def check_write(self, name: str, n_new: int, dimension: int, normalize: str) -> None:
+        """Reject — before allocating — a write that would breach a ceiling.
+
+        ``n_new`` is the upper bound on rows added (the request item count, since
+        id de-duplication can only reduce it). Raises :class:`LimitExceededError`
+        (HTTP 413); reads and existing data are unaffected.
+        """
+
+        if self.max_patterns_per_memory <= 0 and self.max_total_bytes <= 0:
+            return
+        with self._lock:
+            existing = self._memories.get(name)
+            current = existing.count if existing else 0
+            if (
+                self.max_patterns_per_memory > 0
+                and current + n_new > self.max_patterns_per_memory
+            ):
+                raise LimitExceededError(
+                    f"write to memory {name!r} would exceed "
+                    f"NEURODB_MAX_PATTERNS_PER_MEMORY ({self.max_patterns_per_memory}): "
+                    f"{current} existing + {n_new} new."
+                )
+            if self.max_total_bytes > 0:
+                per_row = dimension * 4 * (2 if normalize != "none" else 1)
+                added = n_new * per_row
+                total = self.approx_total_bytes()
+                if total + added > self.max_total_bytes:
+                    raise LimitExceededError(
+                        f"write to memory {name!r} would exceed "
+                        f"NEURODB_MAX_TOTAL_BYTES ({self.max_total_bytes}): "
+                        f"~{total} current + ~{added} new bytes."
+                    )
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
             # Per-memory detail carries the normalize mode and, for zscore, the
             # per-dimension mean/std (handy for debugging an anomaly flag).
             memories = [mem.stats() for mem in self._memories.values()]
+            total_bytes = sum(m["approx_bytes"] for m in memories)
+            budget = self.max_total_bytes
+            for m in memories:
+                m["pct_of_budget"] = (
+                    round(100.0 * m["approx_bytes"] / budget, 2) if budget > 0 else None
+                )
             return {
                 "memories": len(memories),
                 "patterns": sum(m["count"] for m in memories),
                 "data_file": str(self.data_file),
+                "approx_bytes": total_bytes,
+                "max_total_bytes": budget or None,
+                "pct_of_budget": (
+                    round(100.0 * total_bytes / budget, 2) if budget > 0 else None
+                ),
                 "detail": memories,
             }
 

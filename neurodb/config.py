@@ -80,6 +80,19 @@ class Settings:
     )
     # Max items in a single /anomaly/batch or /complete/batch request.
     max_batch: int = field(default_factory=lambda: _env_int("NEURODB_MAX_BATCH", 1024))
+    # Resource ceilings (0 = unlimited). Writes that would breach these are
+    # rejected before allocating; reads keep serving.
+    max_patterns_per_memory: int = field(
+        default_factory=lambda: _env_int("NEURODB_MAX_PATTERNS_PER_MEMORY", 1_000_000)
+    )
+    max_total_bytes: int = field(
+        default_factory=lambda: _env_int("NEURODB_MAX_TOTAL_BYTES", 0)
+    )
+    # /health flips "memory_pressure" once footprint reaches this % of the byte
+    # budget (only meaningful when NEURODB_MAX_TOTAL_BYTES is set).
+    memory_pressure_pct: float = field(
+        default_factory=lambda: _env_float("NEURODB_MEMORY_PRESSURE_PCT", 90.0)
+    )
     # Fail-closed on an unreadable data file instead of quarantining + empty start.
     fail_on_corrupt_load: bool = field(
         default_factory=lambda: _env_bool("NEURODB_FAIL_ON_CORRUPT_LOAD", False)

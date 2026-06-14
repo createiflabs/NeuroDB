@@ -78,3 +78,23 @@ def test_nan_vector_rejected(store_factory):
     mem = store.create_memory("m", 2)
     with pytest.raises(MemoryError_):
         mem.write([{"vector": [float("nan"), 0]}])
+
+
+def test_zscore_empty_memory_no_crash(store_factory):
+    # std is undefined with no patterns → the stats fallback must keep the
+    # empty-memory contract (None reconstruction, empty fields) intact.
+    store = store_factory()
+    mem = store.create_memory("m", 2, normalize="zscore")
+    assert mem.complete([1, 0])["reconstruction"] is None
+    assert mem.anomaly([1, 0])["fields"] == []
+
+
+def test_zscore_single_pattern_no_crash(store_factory):
+    # With <2 patterns the zscore stats fall back to mean=0/std=1 (identity), so
+    # recall just returns the one stored row without dividing by a zero std.
+    store = store_factory()
+    mem = store.create_memory("m", 2, beta=10.0, normalize="zscore")
+    mem.write([{"vector": [3, 4]}])
+    out = mem.complete([3, 4])
+    assert out["reconstruction"][0] == pytest.approx(3.0, abs=1e-4)
+    assert out["reconstruction"][1] == pytest.approx(4.0, abs=1e-4)

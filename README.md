@@ -503,6 +503,26 @@ upgrades, the slowlog, and the API-stability promise, see
 
 ---
 
+## Reference collections
+
+A **collection** is a portable, signed bundle — a curated reference population
+plus its baseline, schema, and provenance — that loads as a ready-to-score
+memory. Map your table to its schema and start validating on day one; no
+clean-baseline-of-your-own required.
+
+```bash
+python examples/collections/build_sample.py          # build the toy sample
+neurodb collection info examples/collections/sample_service_health.ndcoll
+neurodb collection load examples/collections/sample_service_health.ndcoll
+```
+
+The **format and tooling are open** (build/sign/verify/load + a synthetic-
+generation framework with realism diagnostics); *specific* domain-validated,
+attested collections are licensed content. See
+[`docs/COLLECTIONS.md`](docs/COLLECTIONS.md).
+
+---
+
 ## Development
 
 ```bash

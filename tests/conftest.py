@@ -116,6 +116,19 @@ def client(client_factory) -> TestClient:
 
 
 @pytest.fixture()
+def db(client):
+    """A NeuroDB Python client whose transport drives the in-process TestClient."""
+
+    from neurodb_client import connect
+
+    def transport(method, url, headers, data, timeout):
+        resp = client.request(method, url, content=data, headers=headers)
+        return resp.status_code, resp.content
+
+    return connect("", transport=transport)
+
+
+@pytest.fixture()
 def api_headers() -> dict[str, str]:
     """Headers carrying the key used by :func:`auth_client`."""
 

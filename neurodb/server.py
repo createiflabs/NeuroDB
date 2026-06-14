@@ -14,7 +14,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,7 +37,7 @@ from .models import (
     TextWriteRequest,
     WriteRequest,
 )
-from .observability import CONTENT_TYPE_LATEST, Metrics, request_id_var
+from .observability import CONTENT_TYPE_LATEST, Metrics, SlowLog, request_id_var
 from .store import LimitExceededError, MemoryError_, NeuroStore, NotFoundError, StoreError
 
 logger = logging.getLogger("neurodb")
@@ -60,6 +60,17 @@ def _is_legacy_data_path(path: str) -> bool:
     """True for an unversioned data path (i.e. not already under /v1)."""
 
     return any(path == p or path.startswith(p + "/") for p in _LEGACY_DATA_PREFIXES)
+
+
+def _memory_from_path(path: str) -> str | None:
+    """Extract the memory name from a ``.../memories/{name}/...`` path, if any."""
+
+    parts = path.strip("/").split("/")
+    if "memories" in parts:
+        i = parts.index("memories")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    return None
 
 
 def _error_response(request, status: int, code: str, message, **extra) -> JSONResponse:
@@ -129,6 +140,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         max_total_bytes=settings.max_total_bytes,
     )
     metrics = Metrics()
+    slowlog = SlowLog(settings.slowlog_ms, settings.slowlog_size)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -236,6 +248,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         route = request.scope.get("route")
         label = getattr(route, "path", "unmatched")
         metrics.observe_request(request.method, label, response.status_code, duration)
+        # Slowlog: timing + shape only (route, memory, batch_size, pattern_count
+        # set by the handler on request.state) — never record contents.
+        if _is_legacy_data_path(request.url.path) or request.url.path.startswith("/v1/"):
+            slowlog.record(
+                duration * 1000.0,
+                request_id=rid,
+                method=request.method,
+                route=label,
+                status=response.status_code,
+                memory=_memory_from_path(request.url.path),
+                batch_size=getattr(request.state, "batch_size", None),
+                pattern_count=getattr(request.state, "pattern_count", None),
+            )
         response.headers["X-Request-ID"] = rid
         # Nudge clients off the unversioned (legacy) data routes.
         if _is_legacy_data_path(request.url.path):
@@ -350,6 +375,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def stats():
         return store.stats()
 
+    @api.get("/slowlog", tags=["system"])
+    async def slowlog_endpoint(limit: int = Query(50, ge=1, le=1000)):
+        """Recent slow data operations (admin: same API key as the data API).
+        Timing + shape metadata only; no record contents are ever stored."""
+
+        return {
+            "threshold_ms": slowlog.threshold_ms,
+            "entries": slowlog.recent(limit),
+        }
+
     @api.post("/backup", tags=["system"])
     async def backup(download: bool = Query(False)):
         """Write a consistent snapshot to the configured backup dir (admin: same
@@ -402,11 +437,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # -- patterns (writing is appending a vector) ------------------------
     @api.post("/memories/{name}/patterns", tags=["patterns"])
-    async def write_patterns(name: str, body: WriteRequest):
+    async def write_patterns(name: str, body: WriteRequest, request: Request):
         mem = store.get_memory(name)
         store.check_write(name, len(body.items), mem.dimension, mem.normalize)
         items = [item.model_dump() for item in body.items]
         affected = await run_in_threadpool(mem.write, items)
+        metrics.record_op("write")
+        request.state.pattern_count = mem.count
         return {"written": len(affected), "ids": affected}
 
     @api.get("/memories/{name}/patterns/{pattern_id}", tags=["patterns"])
@@ -416,9 +453,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @api.patch("/memories/{name}/patterns/{pattern_id}", tags=["patterns"])
     async def update_pattern(name: str, pattern_id: str, body: PatternUpdate):
         mem = store.get_memory(name)
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             mem.update, pattern_id, body.vector, body.metadata, body.merge_metadata
         )
+        metrics.record_op("update")
+        return result
 
     @api.delete("/memories/{name}/patterns/{pattern_id}", tags=["patterns"])
     async def delete_pattern(name: str, pattern_id: str):
@@ -426,6 +465,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         removed = await run_in_threadpool(mem.delete, [pattern_id])
         if removed == 0:
             raise NotFoundError(f"Pattern {pattern_id!r} not found in memory {name!r}.")
+        metrics.record_op("delete")
         return {"deleted": pattern_id}
 
     def _check_batch_size(items: list) -> None:
@@ -444,9 +484,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @api.post("/memories/{name}/complete/batch", tags=["recall"])
-    async def complete_batch(name: str, body: CompleteBatchRequest):
+    async def complete_batch(name: str, body: CompleteBatchRequest, request: Request):
         mem = store.get_memory(name)
         _check_batch_size(body.items)
+        metrics.observe_batch("/v1/memories/{name}/complete/batch", len(body.items))
+        request.state.batch_size = len(body.items)
         vectors = [it.vector for it in body.items]
         results = await run_in_threadpool(
             mem.complete_batch, vectors, body.beta, body.mask, body.steps, body.top_k, body.filter
@@ -471,9 +513,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @api.post("/memories/{name}/anomaly/batch", tags=["recall"])
-    async def anomaly_batch(name: str, body: AnomalyBatchRequest):
+    async def anomaly_batch(name: str, body: AnomalyBatchRequest, request: Request):
         mem = store.get_memory(name)
         _check_batch_size(body.items)
+        metrics.observe_batch("/v1/memories/{name}/anomaly/batch", len(body.items))
+        request.state.batch_size = len(body.items)
         vectors = [it.vector for it in body.items]
         results = await run_in_threadpool(
             mem.anomaly_batch, vectors, body.beta, body.top_k, body.filter

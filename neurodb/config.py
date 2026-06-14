@@ -104,6 +104,14 @@ class Settings:
     backup_dir: str = field(
         default_factory=lambda: _env_str("NEURODB_BACKUP_DIR", "./data/backups")
     )
+    # Data operations slower than this (ms) are recorded in the slowlog.
+    slowlog_ms: float = field(
+        default_factory=lambda: _env_float("NEURODB_SLOWLOG_MS", 200.0)
+    )
+    # Max entries retained in the in-memory slowlog ring buffer.
+    slowlog_size: int = field(
+        default_factory=lambda: _env_int("NEURODB_SLOWLOG_SIZE", 100)
+    )
 
 
 def get_settings() -> Settings:

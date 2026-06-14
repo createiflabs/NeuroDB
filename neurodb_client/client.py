@@ -267,3 +267,30 @@ class Memory:
 
     def capacity(self) -> Any:
         return self._client._request("GET", self._path("/capacity"))
+
+    # -- dataset validation ----------------------------------------------
+    def validate(
+        self,
+        records: Iterable[Any],
+        *,
+        threshold: float = 3.0,
+        fields: Sequence[str] | None = None,
+        beta: float | None = None,
+        filter: dict[str, Any] | None = None,
+    ) -> Any:
+        """Validate a dataset against this memory, returning a ``ValidationReport``.
+
+        Streams ``records`` through the anomaly endpoint and flags any field whose
+        standardized deviation exceeds ``threshold``. See :mod:`neurodb_client.validate`.
+        """
+
+        from .validate import run_validation
+
+        return run_validation(
+            self,
+            records,
+            threshold=threshold,
+            fields=fields,
+            beta=beta,
+            filter=filter,
+        )

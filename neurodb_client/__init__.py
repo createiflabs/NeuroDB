@@ -16,6 +16,7 @@ Uses only the standard library (``urllib``), matching NeuroDB's lean ethos.
 
 from __future__ import annotations
 
+from . import telemetry
 from .client import (
     BadRequest,
     Client,
@@ -24,6 +25,12 @@ from .client import (
     NotFound,
     Unauthorized,
     connect,
+)
+from .validate import (
+    FieldResult,
+    RecordResult,
+    ValidationReport,
+    run_validation,
 )
 
 __all__ = [
@@ -34,4 +41,9 @@ __all__ = [
     "BadRequest",
     "NotFound",
     "Unauthorized",
+    "run_validation",
+    "ValidationReport",
+    "RecordResult",
+    "FieldResult",
+    "telemetry",
 ]

@@ -36,6 +36,15 @@ class CreateMemoryRequest(BaseModel):
         max_length=MAX_DIMENSION,
         description="Optional per-dimension field names (len must equal dimension).",
     )
+    normalize: Literal["none", "zscore", "l2"] | None = Field(
+        None,
+        description=(
+            "Pattern normalization applied before Hopfield recall. 'zscore' "
+            "(per-dimension standardize) is recommended for structured records; "
+            "'l2' for unit-direction embeddings; 'none' for the raw dot product. "
+            "Omit to default to 'zscore' when 'fields' is given, else 'none'."
+        ),
+    )
 
 
 class PatternItem(BaseModel):

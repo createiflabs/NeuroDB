@@ -336,7 +336,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @api.post("/memories", tags=["memories"], status_code=201)
     async def create_memory(body: CreateMemoryRequest):
-        mem = store.create_memory(body.name, body.dimension, body.beta, body.fields)
+        mem = store.create_memory(
+            body.name, body.dimension, body.beta, body.fields, body.normalize
+        )
         return mem.info()
 
     @api.get("/memories", tags=["memories"])

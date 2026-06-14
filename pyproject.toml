@@ -47,7 +47,7 @@ Source = "https://github.com/createiflabs/NeuroDB"
 Issues = "https://github.com/createiflabs/NeuroDB/issues"
 
 [tool.setuptools.packages.find]
-include = ["neurodb*"]
+include = ["neurodb*", "neurodb_client*"]
 
 [tool.setuptools.package-data]
 neurodb = ["static/*"]

@@ -78,6 +78,28 @@ def _cmd_migrate(args: argparse.Namespace) -> None:
     print(f"migrated {data_file}: manifest v{before} -> v{after}")
 
 
+def _cmd_export(args: argparse.Namespace) -> None:
+    from .portability import export_memory_jsonl
+    from .store import NeuroStore
+
+    store = NeuroStore(_data_file(args), wal=False)
+    mem = store.get_memory(args.name)
+    with open(args.dest, "w", encoding="utf-8") as fh:
+        n = export_memory_jsonl(mem, fh)
+    print(f"exported {n} patterns from memory {args.name!r} to {args.dest}")
+
+
+def _cmd_import(args: argparse.Namespace) -> None:
+    from .portability import import_memory_jsonl
+    from .store import NeuroStore
+
+    store = NeuroStore(_data_file(args))
+    with open(args.src, encoding="utf-8") as fh:
+        mem = import_memory_jsonl(store, fh, args.name)
+    store.save_all()
+    print(f"imported memory {mem.name!r} ({mem.count} patterns) into {_data_file(args)}")
+
+
 def _cmd_collection(args: argparse.Namespace) -> None:
     import json
 
@@ -113,6 +135,16 @@ def main(argv: list[str] | None = None) -> None:
     p_migrate = sub.add_parser("migrate", help="upgrade the data file to the current format")
     p_migrate.add_argument("--data-file", help="override NEURODB_DATA_FILE")
 
+    p_export = sub.add_parser("export", help="export a memory to portable JSONL")
+    p_export.add_argument("name", help="memory to export")
+    p_export.add_argument("dest", help="destination .jsonl file")
+    p_export.add_argument("--data-file", help="override NEURODB_DATA_FILE")
+
+    p_import = sub.add_parser("import", help="import a memory from JSONL")
+    p_import.add_argument("src", help="source .jsonl file")
+    p_import.add_argument("--name", help="override the memory name in the export")
+    p_import.add_argument("--data-file", help="override NEURODB_DATA_FILE")
+
     p_coll = sub.add_parser("collection", help="inspect/verify/load collection bundles")
     coll_sub = p_coll.add_subparsers(dest="collection_command", required=True)
     p_ci = coll_sub.add_parser("info", help="print a bundle's metadata (no patterns)")
@@ -134,6 +166,10 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_restore(args)
     elif args.command == "migrate":
         _cmd_migrate(args)
+    elif args.command == "export":
+        _cmd_export(args)
+    elif args.command == "import":
+        _cmd_import(args)
     elif args.command == "collection":
         _cmd_collection(args)
     else:  # pragma: no cover - argparse rejects unknown commands

@@ -97,6 +97,9 @@ class Settings:
     fail_on_corrupt_load: bool = field(
         default_factory=lambda: _env_bool("NEURODB_FAIL_ON_CORRUPT_LOAD", False)
     )
+    # Write-ahead log: durably record writes between snapshots so a crash replays
+    # them on boot (on by default — a snapshot-only store loses recent writes).
+    wal_enabled: bool = field(default_factory=lambda: _env_bool("NEURODB_WAL", True))
     embedding_dim: int = field(default_factory=lambda: _env_int("NEURODB_EMBEDDING_DIM", 256))
     log_level: str = field(default_factory=lambda: _env_str("NEURODB_LOG_LEVEL", "info"))
     log_format: str = field(default_factory=lambda: _env_str("NEURODB_LOG_FORMAT", "json"))

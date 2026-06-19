@@ -1,0 +1,5 @@
+# Benchmark-only dependencies. NOT required to run NeuroDB itself — the runtime
+# core (requirements.txt) stays dependency-light. These power the Tier 0
+# completion benchmark (benchmarks/) and the gate test.
+-r requirements-dev.txt
+scikit-learn>=1.4

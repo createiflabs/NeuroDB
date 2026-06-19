@@ -12,6 +12,7 @@ import threading
 import numpy as np
 
 import neurodb.store as store_mod
+from neurodb.store import Memory
 
 
 def test_write_during_save_stays_dirty(store_factory, monkeypatch):
@@ -49,7 +50,10 @@ def test_save_snapshots_a_consistent_view(store_factory, monkeypatch):
     the ids list. The fix snapshots ids + matrix together under the memory lock.
     """
 
-    store = store_factory()
+    # WAL off: this test monkeypatches json.dumps to inject a write, and the WAL
+    # append also serializes via json.dumps — recursion. It targets the snapshot
+    # path, so the WAL is irrelevant here.
+    store = store_factory(wal=False)
     mem = store.create_memory("m", 2)
     mem.write([{"id": "a", "vector": [1.0, 0.0]}])
 
@@ -102,3 +106,56 @@ def test_concurrent_writes_and_saves_stay_consistent(store_factory):
         vec = np.asarray(m2.get(_id)["vector"], dtype=np.float64)
         assert vec.shape == (4,)
         assert np.all(np.isfinite(vec))
+
+
+def test_concurrent_readers_during_write_consistent():
+    """Many readers query a memory while a writer hammers it; every read must
+    see a self-consistent state (matrix rows == ids == metadata, valid results)
+    and no read may raise. The per-memory lock guarantees this."""
+
+    dim = 8
+    mem = Memory("c", dim, fields=[f"f{i}" for i in range(dim)])
+    seed_rng = np.random.default_rng(0)
+    mem.write([{"id": f"seed-{i}", "vector": seed_rng.normal(size=dim)} for i in range(300)])
+
+    errors: list[str] = []
+    stop = threading.Event()
+
+    def writer() -> None:
+        rng = np.random.default_rng(1)  # writer is single-threaded → rng is safe
+        i = 0
+        while i < 2000:
+            mem.write([{"id": f"w-{i}", "vector": rng.normal(size=dim)}])
+            if i % 7 == 0:
+                mem.write([{"vector": rng.normal(size=dim)} for _ in range(5)])
+            if i % 11 == 0 and i > 50:
+                mem.delete([f"w-{i - 40}"])
+            i += 1
+        stop.set()
+
+    def reader() -> None:
+        zero = np.zeros(dim)
+        try:
+            while not stop.is_set():
+                with mem._lock:  # observe the invariant atomically
+                    assert mem._X.shape[0] == len(mem.ids) == len(mem.metadata)
+                    assert mem._X.shape[1] == dim
+                res = mem.complete(zero, mask=[0, 1, 2], steps=2)
+                if res["reconstruction"] is not None:
+                    assert len(res["reconstruction"]) == dim
+                for hit in mem.search(zero, k=5):
+                    assert isinstance(hit["id"], str)
+                    assert np.isfinite(hit["score"])
+                assert len(mem.search_batch(np.zeros((4, dim)), k=3)) == 4
+        except Exception as exc:  # noqa: BLE001 — capture, assert in main thread
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=writer)]
+    threads += [threading.Thread(target=reader) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not errors, errors[:5]
+    assert mem._X.shape[0] == len(mem.ids) == len(mem.metadata) == mem.count

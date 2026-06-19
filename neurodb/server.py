@@ -144,6 +144,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         fail_on_corrupt_load=settings.fail_on_corrupt_load,
         max_patterns_per_memory=settings.max_patterns_per_memory,
         max_total_bytes=settings.max_total_bytes,
+        wal=settings.wal_enabled,
     )
     metrics = Metrics()
     slowlog = SlowLog(settings.slowlog_ms, settings.slowlog_size)

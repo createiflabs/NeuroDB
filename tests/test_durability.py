@@ -15,7 +15,9 @@ from neurodb.store import NeuroStore
 
 
 def test_save_fsyncs_before_replace(store_factory, monkeypatch):
-    store = store_factory()
+    # Targets the .npz snapshot layer; WAL off so the only os.replace is the
+    # snapshot rename (the WAL adds an earlier rotate rename).
+    store = store_factory(wal=False)
     store.create_memory("m", 2).write([{"id": "a", "vector": [1.0, 0.0]}])
 
     calls: list[str] = []
@@ -100,8 +102,10 @@ def test_failed_save_makes_ready_return_503(tmp_path):
 
 def test_interrupt_before_rename_preserves_live_file(store_factory, monkeypatch):
     # kill -9 between the fsync'd temp write and the atomic rename: the previous
-    # live file must remain intact and reload cleanly (no torn data).
-    store = store_factory()
+    # live file must remain intact and reload cleanly (no torn data). WAL off so
+    # the lost write 'b' is not recovered (this test targets snapshot atomicity;
+    # WAL recovery is covered by test_wal.py).
+    store = store_factory(wal=False)
     store.create_memory("m", 2).write([{"id": "a", "vector": [1, 0]}])
     store.save_all()
     good_bytes = store.data_file.read_bytes()
@@ -122,15 +126,26 @@ def test_interrupt_before_rename_preserves_live_file(store_factory, monkeypatch)
     assert not (store.data_file.parent / "db.npz.tmp").exists()
 
 
-def test_write_without_flush_is_not_yet_persisted(tmp_path):
-    # Documents the bounded loss window: autosave off + no flush => not on disk.
+def test_wal_makes_writes_durable_without_flush(tmp_path):
+    # With the WAL (server default), an acknowledged write is recoverable from
+    # disk even before any snapshot/flush — the old loss window is closed.
     path = tmp_path / "db.npz"
     settings = Settings(data_file=str(path), autosave_interval=0.0, allow_anonymous=True)
-    app = create_app(settings)
-    with TestClient(app) as client:
+    with TestClient(create_app(settings)) as client:
         client.post("/memories", json={"name": "m", "dimension": 2})
         client.post("/memories/m/patterns", json={"items": [{"id": "a", "vector": [1, 0]}]})
-        # Peek at the on-disk state mid-session (create_memory persisted the
-        # empty memory, but the pattern write has not been flushed).
-        on_disk = NeuroStore(path)
-        assert on_disk.get_memory("m").count == 0
+        # A fresh reader replays the WAL and sees the unflushed write.
+        assert NeuroStore(path).get_memory("m").count == 1
+
+
+def test_without_wal_unflushed_write_is_not_persisted(tmp_path):
+    # With the WAL disabled the bounded loss window returns: autosave off + no
+    # flush => the pattern write is not yet on disk (only the empty memory is).
+    path = tmp_path / "db.npz"
+    settings = Settings(
+        data_file=str(path), autosave_interval=0.0, allow_anonymous=True, wal_enabled=False
+    )
+    with TestClient(create_app(settings)) as client:
+        client.post("/memories", json={"name": "m", "dimension": 2})
+        client.post("/memories/m/patterns", json={"items": [{"id": "a", "vector": [1, 0]}]})
+        assert NeuroStore(path, wal=False).get_memory("m").count == 0

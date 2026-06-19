@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 
 from .hopfield import retrieve, softmax
-from .metrics import compute_scores
+from .metrics import compute_scores, compute_scores_batch
 from .migrations import migrate
 
 logger = logging.getLogger("neurodb.store")
@@ -242,7 +242,12 @@ class Memory:
         self.ids: list[str] = []
         self.metadata: list[dict[str, Any]] = []
         self._index: dict[str, int] = {}
-        self._X = np.zeros((0, self.dimension), dtype=np.float32)
+        # Patterns occupy the first ``self._n`` rows of a geometric-growth
+        # backing buffer, so appends are amortized O(1) instead of an O(N)
+        # ``np.vstack`` per write. ``self._X`` is always the logical view.
+        self._buf = np.zeros((0, self.dimension), dtype=np.float32)
+        self._n = 0
+        self._grow_copies = 0  # rows copied during growth (linear-ingest regression)
         # Cached per-row L2 norms for cosine search; invalidated on mutation.
         self._norms: np.ndarray | None = None
         # Normalization caches, recomputed from self._X on demand and
@@ -255,6 +260,9 @@ class Memory:
         # Cached capacity/saturation diagnostic (lazy; invalidated on mutation).
         self._capacity: dict[str, Any] | None = None
         self._lock = threading.RLock()
+        # Optional write-ahead log, injected by the owning NeuroStore. When set,
+        # write()/delete() durably append a record before returning.
+        self._wal: _WAL | None = None
         # Monotonic write version vs. the version last persisted. A memory is
         # dirty when they differ. This (rather than a bare bool) means a write
         # landing during a save is never silently marked clean — see save().
@@ -263,6 +271,27 @@ class Memory:
         # Collection metadata when this memory was materialized from a bundle
         # (schema/criteria/provenance/attestation/signature summary); else None.
         self.collection: dict[str, Any] | None = None
+
+    # -- backing storage --------------------------------------------------
+    @property
+    def _X(self) -> np.ndarray:
+        """The logical ``(count, dimension)`` pattern matrix (a buffer view)."""
+
+        return self._buf[: self._n]
+
+    def _ensure_capacity(self, extra: int) -> None:
+        """Grow the buffer geometrically so appends stay amortized O(1)."""
+
+        needed = self._n + extra
+        cap = self._buf.shape[0]
+        if needed <= cap:
+            return
+        new_cap = max(needed, cap * 2 if cap else extra)
+        new_buf = np.empty((new_cap, self.dimension), dtype=np.float32)
+        if self._n:
+            new_buf[: self._n] = self._buf[: self._n]
+            self._grow_copies += self._n
+        self._buf = new_buf
 
     # -- introspection ----------------------------------------------------
     @property
@@ -350,6 +379,7 @@ class Memory:
         if self.normalize == "none":
             return self._X
         self._ensure_stats()
+        assert self._Z is not None  # _ensure_stats populated it for non-"none"
         return self._Z
 
     def _normalize_query(self, q: np.ndarray) -> np.ndarray:
@@ -447,6 +477,19 @@ class Memory:
         """Append patterns. Each item: ``{vector, id?, metadata?}``. Existing ids
         are overwritten. Returns the distinct affected ids (in first-seen order)."""
 
+        # Phase 1 — validate the whole batch up front, off the lock. A bad item
+        # raises here with nothing applied, so a batch is all-or-nothing
+        # (per-request atomicity). Auto-ids are assigned now.
+        plan: list[tuple[str, np.ndarray, dict[str, Any]]] = []
+        for item in items:
+            if "vector" not in item:
+                raise MemoryError_("Each item must include a 'vector'.")
+            vec = self._coerce_vector(item["vector"])
+            _id = str(item.get("id") or uuid.uuid4().hex)
+            meta = dict(item.get("metadata") or {})
+            plan.append((_id, vec, meta))
+
+        # Phase 2 — apply under the lock; no validation can fail now.
         with self._lock:
             affected: dict[str, None] = {}  # ordered set of distinct ids
             pending_pos: dict[str, int] = {}
@@ -454,17 +497,12 @@ class Memory:
             new_ids: list[str] = []
             new_meta: list[dict[str, Any]] = []
 
-            for item in items:
-                if "vector" not in item:
-                    raise MemoryError_("Each item must include a 'vector'.")
-                vec = self._coerce_vector(item["vector"])
-                _id = str(item.get("id") or uuid.uuid4().hex)
-                meta = dict(item.get("metadata") or {})
+            for _id, vec, meta in plan:
                 affected[_id] = None
 
                 if _id in self._index:
                     idx = self._index[_id]
-                    self._X[idx] = vec
+                    self._X[idx] = vec  # in-place through the buffer view
                     self.metadata[idx] = meta
                 elif _id in pending_pos:
                     pos = pending_pos[_id]
@@ -477,9 +515,11 @@ class Memory:
                     new_meta.append(meta)
 
             if new_rows:
-                block = np.vstack(new_rows).astype(np.float32)
-                self._X = block if self._X.shape[0] == 0 else np.vstack([self._X, block])
-                start = len(self.ids)
+                m = len(new_rows)
+                start = self._n
+                self._ensure_capacity(m)
+                self._buf[start : start + m] = np.vstack(new_rows).astype(np.float32)
+                self._n += m
                 for offset, _id in enumerate(new_ids):
                     self._index[_id] = start + offset
                 self.ids.extend(new_ids)
@@ -487,6 +527,19 @@ class Memory:
 
             self._invalidate_caches()
             self._version += 1
+            if self._wal is not None:
+                # Durable before we return: a crash before the next snapshot
+                # replays these exact (resolved-id) items on boot.
+                self._wal.append(
+                    {
+                        "op": "w",
+                        "mem": self.name,
+                        "items": [
+                            {"id": _id, "vector": vec.tolist(), "metadata": meta}
+                            for _id, vec, meta in plan
+                        ],
+                    }
+                )
             return list(affected)
 
     def get(self, _id: str) -> dict[str, Any]:
@@ -508,14 +561,19 @@ class Memory:
             if not targets:
                 return 0
             drop = np.array(sorted(self._index[i] for i in targets), dtype=np.int64)
-            mask = np.ones(self._X.shape[0], dtype=bool)
-            mask[drop] = False
-            self._X = self._X[mask]
-            self.ids = [i for j, i in enumerate(self.ids) if mask[j]]
-            self.metadata = [m for j, m in enumerate(self.metadata) if mask[j]]
+            keep = np.ones(self._n, dtype=bool)
+            keep[drop] = False
+            # Compact survivors to the front of a fresh buffer (capacity resets
+            # to exactly count; delete is not the hot path — appends are).
+            self._buf = np.ascontiguousarray(self._X[keep])
+            self._n = int(self._buf.shape[0])
+            self.ids = [i for j, i in enumerate(self.ids) if keep[j]]
+            self.metadata = [m for j, m in enumerate(self.metadata) if keep[j]]
             self._index = {i: j for j, i in enumerate(self.ids)}
             self._invalidate_caches()
             self._version += 1
+            if self._wal is not None:
+                self._wal.append({"op": "d", "mem": self.name, "ids": list(targets)})
             return len(targets)
 
     # -- updating an existing pattern ------------------------------------
@@ -800,6 +858,55 @@ class Memory:
                     row["vector"] = self._X[i].tolist()
                 results.append(row)
             return results
+
+    def search_batch(
+        self,
+        queries: Iterable[Iterable[float]],
+        k: int = 10,
+        include_vectors: bool = False,
+        metric: str = "cosine",
+    ) -> list[list[dict[str, Any]]]:
+        """Nearest patterns for a *batch* of queries, sharing one matmul.
+
+        Returns one result list per query, each identical to what
+        :meth:`search` (without a filter) would return for that query. Ranks on
+        the raw vectors, exactly like :meth:`search`.
+        """
+
+        with self._lock:
+            n = self._X.shape[0]
+            arr = np.asarray(queries, dtype=np.float32)
+            if arr.ndim == 1:  # accept a single query as a 1-row batch
+                arr = arr.reshape(1, -1)
+            q = self._coerce_batch(arr)
+            batch = q.shape[0]
+            if n == 0 or k <= 0 or batch == 0:
+                return [[] for _ in range(batch)]
+            if metric == "cosine":
+                if self._norms is None:
+                    self._norms = np.linalg.norm(self._X, axis=1).astype(np.float32)
+                scores = compute_scores_batch(self._X, q, metric, norms=self._norms)
+            else:
+                scores = compute_scores_batch(self._X, q, metric)
+            out: list[list[dict[str, Any]]] = []
+            for j in range(batch):
+                col = scores[:, j]
+                results: list[dict[str, Any]] = []
+                for i in self._top_k_indices(col, k):
+                    i = int(i)
+                    score = float(col[i])
+                    if not np.isfinite(score):
+                        continue
+                    row: dict[str, Any] = {
+                        "id": self.ids[i],
+                        "score": score,
+                        "metadata": copy.deepcopy(self.metadata[i]),
+                    }
+                    if include_vectors:
+                        row["vector"] = self._X[i].tolist()
+                    results.append(row)
+                out.append(results)
+            return out
 
     def _anomaly_result(
         self,
@@ -1091,7 +1198,8 @@ class Memory:
         mem.ids = ids
         mem.metadata = metadata
         mem._index = {i: j for j, i in enumerate(mem.ids)}
-        mem._X = matrix.astype(np.float32, copy=False)
+        mem._buf = matrix.astype(np.float32, copy=False)
+        mem._n = int(mem._buf.shape[0])
         # Restore collection provenance/attestation if this memory was loaded
         # from a bundle (additive key; absent on plain/legacy memories).
         mem.collection = manifest.get("collection")
@@ -1118,6 +1226,67 @@ def peek_manifest_version(path: str | Path) -> int | None:
         return None
 
 
+class _WAL:
+    """Append-only write-ahead log covering the durability gap between snapshots.
+
+    Each ``write``/``delete`` durably appends one NDJSON record (open → write →
+    fsync → close, so no handle lingers — important on Windows) before the call
+    returns, so a crash replays uncommitted operations on boot. Replay is
+    **idempotent** (records carry resolved ids), so the checkpoint can rotate the
+    current segment to ``.ckpt`` (new writes start fresh), write the snapshot
+    durably, then discard the ``.ckpt``; a crash at any point leaves segments
+    that boot replays in order (``.ckpt`` then current) over the last snapshot.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.ckpt_path = self.path.with_name(self.path.name + ".ckpt")
+        self._lock = threading.Lock()
+
+    def append(self, record: dict[str, Any]) -> None:
+        line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "ab") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    def rotate(self) -> None:
+        """Move the current segment aside for checkpointing; no-op if empty."""
+
+        with self._lock:
+            if self.path.exists():
+                os.replace(self.path, self.ckpt_path)
+
+    def discard_ckpt(self) -> None:
+        with self._lock:
+            self.ckpt_path.unlink(missing_ok=True)
+
+    def reset(self) -> None:
+        with self._lock:
+            self.path.unlink(missing_ok=True)
+            self.ckpt_path.unlink(missing_ok=True)
+
+    def read_segments(self) -> list[dict[str, Any]]:
+        """All records, ``.ckpt`` (older) before the current segment (newer)."""
+
+        records: list[dict[str, Any]] = []
+        for segment in (self.ckpt_path, self.path):
+            if not segment.exists():
+                continue
+            with open(segment, "rb") as handle:
+                for raw in handle:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        records.append(json.loads(raw))
+                    except json.JSONDecodeError:
+                        break  # torn tail record after a crash mid-append — stop
+        return records
+
+
 class NeuroStore:
     """Owns every :class:`Memory` and persists them all to a single ``.npz`` file."""
 
@@ -1127,6 +1296,7 @@ class NeuroStore:
         fail_on_corrupt_load: bool = False,
         max_patterns_per_memory: int = 0,
         max_total_bytes: int = 0,
+        wal: bool = True,
     ) -> None:
         self.data_file = Path(data_file)
         self.fail_on_corrupt_load = fail_on_corrupt_load
@@ -1138,7 +1308,13 @@ class NeuroStore:
         self._lock = threading.RLock()
         # Readiness signal: did the most recent persist succeed?
         self.last_save_ok = True
+        # Write-ahead log covering the durability gap between snapshots.
+        self._wal: _WAL | None = (
+            _WAL(self.data_file.with_name(self.data_file.name + ".wal")) if wal else None
+        )
         self.load()
+        self._recover_from_wal()  # replay uncommitted writes from a prior crash
+        self._wire_wal()  # only now do live writes start logging
 
     # -- memory lifecycle -------------------------------------------------
     def create_memory(
@@ -1154,6 +1330,7 @@ class NeuroStore:
             if name in self._memories:
                 raise MemoryError_(f"Memory {name!r} already exists.")
             mem = Memory(name, dimension, beta, fields, normalize)
+            mem._wal = self._wal
             self._memories[name] = mem
             self.save()
             return mem
@@ -1414,6 +1591,49 @@ class NeuroStore:
                 exc,
             )
 
+    def _wire_wal(self) -> None:
+        if self._wal is None:
+            return
+        for mem in self._memories.values():
+            mem._wal = self._wal
+
+    def _recover_from_wal(self) -> None:
+        """Replay WAL segments into the loaded memories, fold the result into a
+        fresh snapshot, and clear the log.
+
+        Replay runs *before* the memories' WAL hooks are wired, so re-applying a
+        record does not re-log it. Records for memories that no longer exist
+        (e.g. their snapshot was quarantined) are skipped.
+        """
+
+        if self._wal is None:
+            return
+        records = self._wal.read_segments()
+        if not records:
+            return
+        applied = 0
+        for rec in records:
+            name = rec.get("mem")
+            if not isinstance(name, str):
+                continue
+            mem = self._memories.get(name)
+            if mem is None:
+                continue
+            op = rec.get("op")
+            if op == "w":
+                mem.write(rec.get("items", []))
+                applied += 1
+            elif op == "d":
+                mem.delete(rec.get("ids", []))
+                applied += 1
+        if applied:
+            logger.warning(
+                "recovered %d uncommitted WAL record(s) from %s", applied, self._wal.path
+            )
+        # Fold recovered state into a durable snapshot, then wipe the log.
+        self.save()
+        self._wal.reset()
+
     def save(self) -> None:
         try:
             self._save_locked()
@@ -1425,6 +1645,11 @@ class NeuroStore:
     def _save_locked(self) -> None:
         with self._lock:
             self.data_file.parent.mkdir(parents=True, exist_ok=True)
+            # Rotate the WAL aside first so writes landing during the snapshot go
+            # to a fresh segment (recovered next boot if they miss this snapshot);
+            # the rotated segment is fully covered by the snapshot we are writing.
+            if self._wal is not None:
+                self._wal.rotate()
             mems = list(self._memories.values())
             # Snapshot every memory first (each under its own lock) so the
             # serialized matrix and ids/metadata are mutually consistent even
@@ -1454,6 +1679,9 @@ class NeuroStore:
             # keeps the memory dirty for the next flush.
             for mem, snap in zip(mems, snapshots, strict=True):
                 mem.mark_saved(snap.version)
+            # The rotated segment is now durably folded into the snapshot.
+            if self._wal is not None:
+                self._wal.discard_ckpt()
 
     def _fsync_dir(self) -> None:
         """fsync the parent directory so the rename itself is durable (POSIX).

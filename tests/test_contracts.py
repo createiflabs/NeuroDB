@@ -84,7 +84,12 @@ def test_namespace_isolation(store_factory):
 
 # -- Tier 3.4: deterministic encoding across restarts ---------------------
 def _embed_digest(text: str, dim: int, hashseed: str) -> str:
-    """Embed ``text`` in a *fresh* interpreter under a given PYTHONHASHSEED."""
+    """Embed ``text`` in a *fresh* interpreter under a given PYTHONHASHSEED.
+
+    The subprocess gets a tightly-controlled environment (only what the OS needs
+    to launch Python and import an installed package, plus the hash seed), so no
+    app-level env from a concurrently-running test can influence the result.
+    """
 
     code = (
         "import hashlib;"
@@ -92,15 +97,20 @@ def _embed_digest(text: str, dim: int, hashseed: str) -> str:
         f"v = embed_text({text!r}, {dim});"
         "print(hashlib.sha256(v.tobytes()).hexdigest())"
     )
-    env = dict(os.environ, PYTHONHASHSEED=hashseed)
+    keep = (
+        "PATH", "PATHEXT", "SYSTEMROOT", "SystemRoot", "WINDIR",
+        "TEMP", "TMP", "LD_LIBRARY_PATH", "VIRTUAL_ENV",
+    )
+    env = {k: v for k, v in os.environ.items() if k in keep}
+    env["PYTHONHASHSEED"] = hashseed
     proc = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         env=env,
         cwd=_REPO_ROOT,
-        check=True,
     )
+    assert proc.returncode == 0, f"subprocess failed (seed={hashseed}): {proc.stderr}"
     return proc.stdout.strip()
 
 

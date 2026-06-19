@@ -28,6 +28,7 @@ from typing import Any
 
 import numpy as np
 
+from .ann import ANNIndex, ann_available
 from .hopfield import retrieve, softmax
 from .metrics import compute_scores, compute_scores_batch
 from .migrations import migrate
@@ -259,6 +260,10 @@ class Memory:
         self._std: np.ndarray | None = None
         # Cached capacity/saturation diagnostic (lazy; invalidated on mutation).
         self._capacity: dict[str, Any] | None = None
+        # Optional ANN candidate index for approximate search; rebuilt lazily
+        # when stale (``_ann_version`` lags ``_version``).
+        self._ann: ANNIndex | None = None
+        self._ann_version = -1
         self._lock = threading.RLock()
         # Optional write-ahead log, injected by the owning NeuroStore. When set,
         # write()/delete() durably append a record before returning.
@@ -292,6 +297,24 @@ class Memory:
             new_buf[: self._n] = self._buf[: self._n]
             self._grow_copies += self._n
         self._buf = new_buf
+
+    def _ensure_ann(self) -> ANNIndex:
+        """Build (or rebuild on staleness) the ANN candidate index. Under lock.
+
+        Version-based staleness rebuilds the whole index after any write/delete —
+        the right trade for read-heavy approximate search (built once, reused
+        across many queries); falls back to exact when the data churns.
+        """
+
+        if not ann_available():
+            raise MemoryError_(
+                "approximate search requires the optional hnswlib backend "
+                "(pip install 'neurodb[ann]')."
+            )
+        if self._ann is None or self._ann_version != self._version:
+            self._ann = ANNIndex(self._X)
+            self._ann_version = self._version
+        return self._ann
 
     # -- introspection ----------------------------------------------------
     @property
@@ -815,8 +838,16 @@ class Memory:
         flt: dict[str, Any] | None = None,
         include_vectors: bool = False,
         metric: str = "cosine",
+        approx: bool = False,
     ) -> list[dict[str, Any]]:
-        """Nearest stored patterns by similarity (cosine by default)."""
+        """Nearest stored patterns by similarity (cosine by default).
+
+        With ``approx=True`` (cosine only), an HNSW index pre-selects the top-M
+        candidate rows and only those are scored exactly — O(M·d + log N) instead
+        of O(N·d). Exact (the default) is the source of truth; the approximate
+        path trades a little recall for a lot of speed (see
+        ``approx_within_tolerance_of_exact``) and needs the optional ``hnswlib``.
+        """
 
         with self._lock:
             n = self._X.shape[0]
@@ -828,9 +859,19 @@ class Memory:
             # keeps existing search results stable and avoids double-normalizing
             # a zscore/l2 memory — the normalize mode only affects the Hopfield
             # complete/anomaly path, not similarity search.
-            if metric == "cosine":
-                if self._norms is None:
-                    self._norms = np.linalg.norm(self._X, axis=1).astype(np.float32)
+            if metric == "cosine" and self._norms is None:
+                self._norms = np.linalg.norm(self._X, axis=1).astype(np.float32)
+            if approx and metric == "cosine" and n > k:
+                # ANN pre-filter: exactly score only the top-M candidate rows;
+                # the rest stay -inf, so the filter/top-k path below is unchanged.
+                assert self._norms is not None  # set above for cosine
+                cand = self._ensure_ann().query(q, min(max(k * 10, 64), n))
+                scores = np.full(n, -np.inf, dtype=np.float32)
+                if cand.size:
+                    scores[cand] = compute_scores(
+                        self._X[cand], q, metric, norms=self._norms[cand]
+                    )
+            elif metric == "cosine":
                 scores = compute_scores(self._X, q, metric, norms=self._norms)
             else:
                 scores = compute_scores(self._X, q, metric)

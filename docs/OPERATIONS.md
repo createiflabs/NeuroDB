@@ -2,18 +2,26 @@
 
 ## Durability model
 
-Writes are acknowledged from memory and persisted by:
+Every write/delete is appended to a **write-ahead log** (`<data-file>.wal`) and
+`fsync`'d **before the request returns**, so an acknowledged write survives a
+`kill -9`: on boot the store loads the last `.npz` snapshot and replays the WAL,
+recovering operations not yet snapshotted (regression:
+`wal_replay_recovers_uncommitted_stores`).
+
+The `.npz` snapshot is a periodic **compaction checkpoint** that folds the WAL
+in and truncates it, taken by:
 
 1. **Autosave** — every `NEURODB_AUTOSAVE_INTERVAL` seconds (default 5s) when
    dirty.
 2. **Explicit flush** — `POST /v1/flush` snapshots and `fsync`s synchronously;
-   it returns only once the data is durably on disk. Call it before a planned
-   restart or whenever you need a hard durability point.
+   it returns only once the data is durably on disk.
 3. **Graceful shutdown** — a final durable save on `SIGTERM`.
 
-Each save writes a temp file, `fsync`s it, then atomically renames it over the
-data file (and `fsync`s the directory on POSIX). A crash can lose at most the
-writes since the last of the above events.
+Each snapshot rotates the WAL aside, writes a temp file, `fsync`s it, atomically
+renames it over the data file (and `fsync`s the directory on POSIX), then
+discards the rotated WAL segment — a crash at any step replays cleanly on boot
+(idempotent replay). Set `NEURODB_WAL=0` to disable the log; durability then
+falls back to snapshot-only (a crash loses writes since the last save above).
 
 ## Backup & restore
 

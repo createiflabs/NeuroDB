@@ -119,6 +119,9 @@ class SearchRequest(BaseModel):
     filter: dict[str, Any] | None = None
     include_vectors: bool = False
     metric: Literal["cosine", "dot", "euclidean"] = "cosine"
+    # Approximate (HNSW) candidate pre-filter; cosine only, needs the optional
+    # hnswlib backend. Trades a little recall for O(M·d) instead of O(N·d).
+    approx: bool = False
 
 
 class AnomalyRequest(BaseModel):

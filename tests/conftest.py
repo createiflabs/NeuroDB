@@ -64,8 +64,8 @@ def store_factory(tmp_path) -> Callable[..., NeuroStore]:
     save → reload round-trip against the same path.
     """
 
-    def make(filename: str = "db.npz") -> NeuroStore:
-        return NeuroStore(tmp_path / filename)
+    def make(filename: str = "db.npz", **kwargs) -> NeuroStore:
+        return NeuroStore(tmp_path / filename, **kwargs)
 
     return make
 

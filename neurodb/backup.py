@@ -89,7 +89,10 @@ def restore_file(src: str | Path, data_file: str | Path) -> Path | None:
     # durability: fsync the staged file and the directory around the rename.
     tmp = data_file.with_suffix(data_file.suffix + ".restore-tmp")
     shutil.copy2(src, tmp)
-    with open(tmp, "rb") as handle:
+    # Open read-write: os.fsync requires a writable handle on Windows (a "rb"
+    # handle raises EBADF there), and the file already exists from the copy.
+    with open(tmp, "rb+") as handle:
+        handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, data_file)
     _fsync_dir(data_file.parent)

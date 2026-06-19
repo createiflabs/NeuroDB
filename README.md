@@ -407,6 +407,7 @@ All settings are environment variables:
 | `NEURODB_RATE_LIMIT_PER_MINUTE` | `600`              | Per-client (API key, else IP) request budget; `0` disables.        |
 | `NEURODB_MAX_REQUEST_BYTES`  | `8388608`             | Reject larger request bodies with `413`.                           |
 | `NEURODB_FAIL_ON_CORRUPT_LOAD` | `false`             | Fail startup on an unreadable data file instead of quarantining.   |
+| `NEURODB_WAL`                | `true`                | Write-ahead log for crash durability; `0` = snapshot-only.         |
 | `NEURODB_EMBEDDING_DIM`      | `256`                 | Dimension of the built-in text embedder.                           |
 | `NEURODB_LOG_LEVEL`          | `info`                | Log level.                                                         |
 | `NEURODB_LOG_FORMAT`         | `json`                | `json` (structured, with request ids) or `text`.                  |
@@ -452,18 +453,24 @@ vectorized, not a Python loop. `capacity` reports the network's saturation
 degrading into blends, which a plain vector store can't tell you.
 
 The whole store — every memory's matrix, ids and metadata — serialises to a
-single `.npz` file. Each save snapshots every memory under its lock, writes a
+single `.npz` snapshot. Each save snapshots every memory under its lock, writes a
 temp file, `fsync`s it, and atomically renames it into place, so a crash never
-leaves a torn file and the persisted matrix always matches its ids. Writes are
-buffered in memory and persisted by (a) the periodic autosave when dirty,
-(b) an explicit `POST /v1/flush` (synchronous + durable), and (c) graceful
-shutdown. A `kill -9` can therefore lose up to `NEURODB_AUTOSAVE_INTERVAL`
-seconds of un-flushed writes — call `/v1/flush` when you need a hard durability
-point. A corrupt data file on startup is quarantined (never deleted) and the
-store starts empty, unless `NEURODB_FAIL_ON_CORRUPT_LOAD=1`.
+leaves a torn file and the persisted matrix always matches its ids.
 
-> **Scope:** NeuroDB favours exactness and simplicity over billion-scale ANN.
-> It's a clean, correct associative-memory layer that's easy to reason about.
+**Durability:** every write/delete is appended to a **write-ahead log**
+(`<data-file>.wal`, `fsync`'d) *before the call returns*, so a `kill -9` replays
+the uncommitted operations on boot — no acknowledged write is lost. The `.npz`
+snapshot is a periodic compaction checkpoint (autosave when dirty, explicit
+`POST /v1/flush`, or graceful shutdown) that folds the WAL in and truncates it.
+Set `NEURODB_WAL=0` to fall back to snapshot-only durability (then a `kill -9`
+can lose up to `NEURODB_AUTOSAVE_INTERVAL` seconds of writes). A corrupt data
+file on startup is quarantined (never deleted) and the store starts empty,
+unless `NEURODB_FAIL_ON_CORRUPT_LOAD=1`.
+
+> **Scope:** NeuroDB favours exactness and simplicity, with an optional HNSW
+> `approx` mode for scale. It's a clean, correct associative-memory layer that's
+> easy to reason about; ingest is amortized O(1) (a geometric-growth buffer, not
+> a per-write recopy).
 
 ---
 
@@ -482,10 +489,16 @@ grows **linearly with the number of patterns**. Representative single-node numbe
 
 Single-record anomaly stays sub-10 ms into the 100k range; batch latency and
 memory scale with N. A `zscore`/`l2` memory keeps a cached normalized matrix, so
-it costs roughly **2× raw** (`N·D·4` bytes). Past a few hundred thousand patterns
-per memory on one node, shard the population across memories or reach for a
-purpose-built ANN index — NeuroDB is built for exact recall and per-field
-attribution at single-node scale.
+it costs roughly **2× raw** (`N·D·4` bytes).
+
+To push `search` past the exact-scan ceiling, pass **`"approx": true`** (cosine
+only): an HNSW index pre-selects the top-M candidates and only those are scored
+exactly — `O(M·d + log N)` instead of `O(N·d)`, recovering ≥90% of the exact
+top-k (see `approx_within_tolerance_of_exact`). It needs the optional backend
+(`pip install 'neurodb[ann]'`); exact remains the default and the source of
+truth. The Hopfield `complete`/`anomaly` paths and beyond-RAM datasets remain
+single-node, exact, in-memory — shard across memories or front with a dedicated
+vector DB past that.
 
 Set resource ceilings so a runaway writer is rejected (HTTP `413`) instead of
 OOM-crashing the process — reads keep serving:

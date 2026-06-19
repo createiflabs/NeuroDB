@@ -57,6 +57,44 @@ def compute_scores(
     raise ValueError(f"Unsupported metric: {metric!r}. Choose from {SUPPORTED_METRICS}.")
 
 
+def compute_scores_batch(
+    matrix: np.ndarray,
+    queries: np.ndarray,
+    metric: str,
+    norms: np.ndarray | None = None,
+) -> np.ndarray:
+    """Score a *batch* of queries against ``matrix`` with one shared matmul.
+
+    ``matrix`` is ``(N, D)`` and ``queries`` is ``(B, D)``; returns ``(N, B)``
+    scores (higher = better). The dominant cost — ``matrix @ queries.T`` — is
+    computed once for the whole batch instead of once per query.
+    """
+
+    b = int(queries.shape[0])
+    if matrix.shape[0] == 0:
+        return np.empty((0, b), dtype=np.float32)
+
+    matrix = matrix.astype(np.float32, copy=False)
+    q = queries.astype(np.float32, copy=False)
+    sims = matrix @ q.T  # (N, B) — the single shared matmul
+
+    if metric == "dot":
+        return sims.astype(np.float32)
+    if metric == "cosine":
+        row_norms = np.linalg.norm(matrix, axis=1) if norms is None else norms
+        row_norms = np.where(row_norms == 0.0, 1.0, row_norms)
+        qnorms = np.linalg.norm(q, axis=1)
+        qnorms = np.where(qnorms == 0.0, 1.0, qnorms)
+        return (sims / row_norms[:, None] / qnorms[None, :]).astype(np.float32)
+    if metric == "euclidean":
+        xsq = np.einsum("ij,ij->i", matrix, matrix)[:, None]
+        qsq = np.einsum("ij,ij->i", q, q)[None, :]
+        dist2 = np.maximum(xsq + qsq - 2.0 * sims, 0.0)
+        return (-np.sqrt(dist2)).astype(np.float32)
+
+    raise ValueError(f"Unsupported metric: {metric!r}. Choose from {SUPPORTED_METRICS}.")
+
+
 def score_to_distance(score: float, metric: str) -> float:
     """Convert an internal score back into an intuitive distance value."""
 

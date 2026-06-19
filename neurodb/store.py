@@ -402,7 +402,8 @@ class Memory:
         if self.normalize == "none":
             return self._X
         self._ensure_stats()
-        assert self._Z is not None  # _ensure_stats populated it for non-"none"
+        if self._Z is None:  # pragma: no cover - _ensure_stats populates it
+            raise AssertionError("normalized matrix not populated")
         return self._Z
 
     def _normalize_query(self, q: np.ndarray) -> np.ndarray:
@@ -864,7 +865,8 @@ class Memory:
             if approx and metric == "cosine" and n > k:
                 # ANN pre-filter: exactly score only the top-M candidate rows;
                 # the rest stay -inf, so the filter/top-k path below is unchanged.
-                assert self._norms is not None  # set above for cosine
+                if self._norms is None:  # pragma: no cover - set above for cosine
+                    raise AssertionError("norms not populated for cosine")
                 cand = self._ensure_ann().query(q, min(max(k * 10, 64), n))
                 scores = np.full(n, -np.inf, dtype=np.float32)
                 if cand.size:

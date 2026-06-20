@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "fastapi>=0.136.3",
+    "fastapi>=0.138.0",
     "uvicorn[standard]>=0.49.0",
     "numpy>=2.2.6",
     "prometheus-client>=0.25.0",
@@ -28,20 +28,20 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.0.3",
+    "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "httpx>=0.28.1",
-    "ruff>=0.15.17",
+    "ruff>=0.15.18",
     "mypy>=2.1.0",
     "bandit>=1.9.4",
     "pip-audit>=2.10.1",
 ]
 ann = ["hnswlib>=0.8"]  # optional approximate-nearest-neighbour backend (future)
 # Optional data-stack adapters for client-side validation (neurodb_client.integrations).
-great-expectations = ["great-expectations>=0.18"]
-airflow = ["apache-airflow>=2.7"]
-dagster = ["dagster>=1.6"]
-integrations = ["great-expectations>=0.18", "apache-airflow>=2.7", "dagster>=1.6"]
+great-expectations = ["great-expectations>=1.18.1"]
+airflow = ["apache-airflow>=3.2.2"]
+dagster = ["dagster>=1.13.10"]
+integrations = ["great-expectations>=1.18.1", "apache-airflow>=3.2.2", "dagster>=1.13.10"]
 
 [project.scripts]
 neurodb = "neurodb.__main__:main"

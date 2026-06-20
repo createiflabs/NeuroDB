@@ -86,7 +86,7 @@ jobs:
           output-file: neurodb.sbom.spdx.json
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: neurodb.sbom.spdx.json
